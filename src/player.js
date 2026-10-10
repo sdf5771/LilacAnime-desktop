@@ -729,7 +729,6 @@ async function takeScreenshot() {
   } catch (error) { toast(`스크린샷을 저장하지 못했어요: ${String(error?.message || error).replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '')}`); }
   finally { player.classList.remove('capturing'); for (const track of shown) track.mode = 'showing'; }
 }
-$('#screenshotPlayer').addEventListener('click', () => { takeScreenshot(); showPlayerControls(); });
 
 // Outside the player the same keys drive focus between cards, tabs and buttons.
 function handleAppKey(event) {
