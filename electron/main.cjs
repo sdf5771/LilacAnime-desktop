@@ -327,9 +327,10 @@ function reanimeMediaFromHtml(html,original){
     anilistId:Number(media.match(/anilist_id:(\d+)/)?.[1])||original.anilistId||null,malId:Number(media.match(/mal_id:(\d+)/)?.[1])||original.malId||null,
     related:reanimeRelated(related,original.id)};
 }
-async function reanimeDetail(anime,html){
+// page(): the series page, fetched only when a JSON route fails (it took a whole request before either went out).
+async function reanimeDetail(anime,page){
   try{const root=await providerFetch(`${REANIME_WEB}/api/v1/anime/${encodeURIComponent(anime.id)}`,{json:true,referer:anime.url});if(root&&typeof root==='object'&&root.anime_id)return reanimeMediaFromJson(root,anime)}catch{/* SSR payload fallback below. */}
-  return reanimeMediaFromHtml(html,anime);
+  return reanimeMediaFromHtml(await page(),anime);
 }
 function reanimeEpisode(raw,anime){
   const number=Number(raw.episode_number);if(!Number.isFinite(number)||number<=0)return null;
@@ -350,13 +351,15 @@ function reanimeSsrEpisodes(html,anime){
   }
   return episodes;
 }
-async function reanimeEpisodes(anime, detailHtml) {
+// listed: the episode route's answer when it was asked already (beside the series route, see provider:detail).
+async function reanimeEpisodes(anime, page, listed = null) {
   // The site's own episode route returns every page at once (the SSR payload only has 100).
   try{
-    const root=await providerFetch(`${REANIME_WEB}/api/v1/anime/${encodeURIComponent(anime.id)}/episodes?limit=2000`,{json:true,referer:anime.url});
+    const root=await (listed||providerFetch(`${REANIME_WEB}/api/v1/anime/${encodeURIComponent(anime.id)}/episodes?limit=2000`,{json:true,referer:anime.url}));
     const list=(Array.isArray(root?.data)?root.data:[]).map(raw=>reanimeEpisode(raw,anime)).filter(Boolean);
     if(list.length)return [...new Map(list.map(ep=>[ep.number,ep])).values()].sort((a,b)=>a.number-b.number);
   }catch{/* SSR payload fallback below. */}
+  const detailHtml=await page().catch(()=>'');
   const ssr=reanimeSsrEpisodes(detailHtml,anime);
   if(ssr.length)return [...new Map(ssr.map(ep=>[ep.number,ep])).values()].sort((a,b)=>a.number-b.number);
   let episodes=providerEpisodes(detailHtml,'reanime',anime);
@@ -676,7 +679,10 @@ async function ohliDetail(anime){
   try{props=await ohliPage(ohliPath('c',slug));if(!props.comic)throw new Error('애니24에서 이 작품을 찾지 못했습니다.')}
   catch(error){if(own)throw error;const hit=(await ohliSearch(slug)).find(item=>titleCompareKey(item.title)===titleCompareKey(slug));if(!hit)throw error;props=await ohliPage(hit.url)}
   const comic=props.comic,info=ohliInfo(comic),list=[...(props.episodes?.data||[])];
-  for(let page=2;page<=Number(props.episodes?.last_page||1);page++)list.push(...((await ohliPage(`${ohliPath('c',comic.slug)}?page=${page}`)).episodes?.data||[]));
+  // The AniList lookup and the rest of a long series' episode pages (원피스: 13) go out together, not one after another.
+  const native=String(comic.original_title||info['원제']||anime.title_japanese||''),idsLookup=native&&!hasHangul(native)?ohliAnilist(native,String(info['방영일']||'').match(/\d{4}/)?.[0]):Promise.resolve(null);
+  const pages=Array.from({length:Math.max(0,Number(props.episodes?.last_page||1)-1)},(_,index)=>index+2);
+  for(const more of await Promise.all(pages.map(page=>ohliPage(`${ohliPath('c',comic.slug)}?page=${page}`))))list.push(...(more.episodes?.data||[]));
   // The site's order (sort: 100 a numbered episode) is kept for what it cannot tell apart; the numbered episodes come
   // first by number, the specials (OVA, SP) after them. A special between episodes keeps its own number (9.5화 is
   // 9.5, not 5), so it is listed, played and saved apart from the episode its number ends in.
@@ -684,7 +690,7 @@ async function ohliDetail(anime){
     .sort((a,b)=>Number(Boolean(a.special))-Number(Boolean(b.special))||(a.number||0)-(b.number||0)||a.order-b.order).map(({order,...episode})=>episode);
   // A movie is its one episode, whatever the site calls it ("14기", the movie's own title): 1화, as before.
   if(comic.category==='극장판'&&episodes.length===1){const [only]=episodes;delete only.special;Object.assign(only,{name:'1',number:1})}
-  const native=String(comic.original_title||info['원제']||anime.title_japanese||''),ids=native&&!hasHangul(native)?await ohliAnilist(native,String(info['방영일']||'').match(/\d{4}/)?.[0]):null;
+  const ids=await idsLookup;
   if(ids)for(const episode of episodes)if(!episode.special)Object.assign(episode,ids);
   const card=ohliAnime({...comic,episodes_count:episodes.length});
   const data={...anime,...(ids||{}),title:card.title,title_japanese:native,images:card.images.webp.large_image_url?card.images:anime.images,synopsis:card.synopsis||anime.synopsis||'',genres:card.genres.length?card.genres:(String(info['장르']||'').split(',').map(name=>name.trim()).filter(Boolean).map(name=>({name}))),
@@ -696,17 +702,19 @@ async function ohliDetail(anime){
 // player page is opened hidden, its master read in its session, and the best variant is what the app plays.
 async function ohliStream(playerUrl){
   const win=new BrowserWindow({show:false,width:960,height:640,webPreferences:{partition:'persist:lilac-ohli24',contextIsolation:true,nodeIntegration:false,sandbox:true,autoplayPolicy:'no-user-gesture-required',backgroundThrottling:false}});
-  const ses=win.webContents.session;let master=null,headers=null,media=null;
+  const ses=win.webContents.session;let master=null,headers=null,media=null,found=()=>{};
+  // Done the moment the player asks for its playlist (or a video file), not at the next poll.
+  const seen=new Promise(resolve=>{found=resolve});
   ses.webRequest.onSendHeaders({urls:['*://*/*']},details=>{
-    if(!master&&/\/master\.txt(?:$|\?)|\.m3u8(?:$|\?)/i.test(details.url)){master=details.url;headers=details.requestHeaders}
-    else if(!media&&details.resourceType==='media'&&/\.mp4(?:$|\?)/i.test(details.url))media=details.url;
+    if(!master&&/\/master\.txt(?:$|\?)|\.m3u8(?:$|\?)/i.test(details.url)){master=details.url;headers=details.requestHeaders;found()}
+    else if(!media&&details.resourceType==='media'&&/\.mp4(?:$|\?)/i.test(details.url)){media=details.url;found()}
   });
+  let nudge=null,timer=null;
   try{
     win.loadURL(playerUrl,{httpReferrer:`${OHLI24_WEB}/`,userAgent:LINKKF_UA}).catch(()=>{});
-    for(let i=0;i<60&&!master&&!media;i++){
-      await new Promise(resolve=>setTimeout(resolve,500));
-      if(i%4===3)win.webContents.executeJavaScript(`try{window.jwplayer?.().play?.()}catch{};document.querySelectorAll('video').forEach(v=>{v.muted=true;v.play().catch(()=>{})})`,true).catch(()=>{});
-    }
+    // A player waiting for a click is started every 2 s; it is given 30 s in all.
+    nudge=setInterval(()=>win.webContents.executeJavaScript(`try{window.jwplayer?.().play?.()}catch{};document.querySelectorAll('video').forEach(v=>{v.muted=true;v.play().catch(()=>{})})`,true).catch(()=>{}),2000);
+    await Promise.race([seen,new Promise(resolve=>{timer=setTimeout(resolve,30000)})]);
     if(!master&&!media)throw new Error('애니24 영상 주소를 찾지 못했습니다.');
     const subtitle=await ohliCaption(win,playerUrl);
     if(!master)return {url:media,headers:{'User-Agent':LINKKF_UA,Referer:playerUrl},referer:playerUrl,subtitle};
@@ -718,7 +726,7 @@ async function ohliStream(playerUrl){
     // Its segments come from a different host each (ohli1…7ncloud5-nocdn.xyz), so a download fetches them itself, six at
     // a time (mirror), as Miruro's: FFmpeg opens a new connection for every one.
     return {url:variants.sort((a,b)=>b.bandwidth-a.bandwidth)[0].url,headers:{'User-Agent':userAgent},referer:'',hls:true,mirror:true,subtitle};
-  }finally{ses.webRequest.onSendHeaders(null);if(!win.isDestroyed())win.destroy()}
+  }finally{clearInterval(nudge);clearTimeout(timer);ses.webRequest.onSendHeaders(null);if(!win.isDestroyed())win.destroy()}
 }
 // Most videos have the Korean subtitle in the picture; an older raw one ("[Ohys-Raws] New Game! - 01") comes clean, and
 // the player puts the Korean subtitle over it from a file: a captions track of its playlist (an SRT on the player's
@@ -1967,7 +1975,7 @@ async function findAnissiaSubtitle(title,episode,{originalTitle='',offsets=[],ma
         const numbered=post=>{const postSeason=communitySeason(communityPostTitle(post.title)),episodes=communityPostEpisodes(post.title);return ((postSeason??1)===season&&episodes.has(episode))||(season>1&&postSeason==null&&offsets.some(offset=>episodes.has(episode+offset)))};
         const base=value=>communityTitle(value).replace(/\s*(?:\d+\s*기|season\s*\d+|시즌\s*\d+)\s*$/i,'');
         const likely=listed.filter(post=>numbered(post)&&Math.max(communityScore(base(anime.subject),communityPostTitle(post.title)),communityScore(base(title),communityPostTitle(post.title)))>=.52).slice(0,4);
-        for(const post of likely){try{post.html=naver?(await naverPost(naver.blogId,post.logNo)).html:await providerFetch(post.url,{referer:`${origin}/`})}catch{post.html=''}}
+        await Promise.all(likely.map(async post=>{try{post.html=naver?(await naverPost(naver.blogId,post.logNo)).html:await providerFetch(post.url,{referer:`${origin}/`})}catch{post.html=''}}));
         const posts=[...likely.filter(post=>post.html),...(linked&&!likely.some(post=>post.url===linked.url)?[linked]:[])];
         for(const name of [anime.subject,title])if(!matches.length)matches=rankCommunityPosts(posts,name,episode,originalTitle,{offsets});
         // No download link: the files may be packed into the post's image (WinPNG). The episode's own posts first,
@@ -1990,7 +1998,11 @@ async function downloadHls(url,filePath,event){
   if(/#EXT-X-STREAM-INF/i.test(text)){const lines=text.split(/\r?\n/);const variants=[];for(let i=0;i<lines.length;i++)if(lines[i].startsWith('#EXT-X-STREAM-INF')){const bandwidth=Number(lines[i].match(/BANDWIDTH=(\d+)/i)?.[1]||0);const child=lines.slice(i+1).find(x=>x.trim()&&!x.startsWith('#'));if(child)variants.push({bandwidth,url:new URL(child.trim(),playlistUrl).href})}const best=variants.sort((a,b)=>b.bandwidth-a.bandwidth)[0];if(!best)throw new Error('HLS 화질 목록을 해석하지 못했습니다.');playlistUrl=best.url;text=await providerFetch(playlistUrl,{referer:url});}
   if(/#EXT-X-KEY:(?![^\n]*METHOD=NONE)/i.test(text))throw new Error('암호화된 HLS는 오프라인 저장을 지원하지 않습니다.');
   const segments=text.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#')).map(x=>new URL(x,playlistUrl).href);if(!segments.length)throw new Error('HLS 세그먼트를 찾지 못했습니다.');
-  const output=fs.createWriteStream(filePath);try{for(let i=0;i<segments.length;i++){const response=await fetch(segments[i],{headers:{'User-Agent':LINKKF_UA,Referer:playlistUrl}});if(!response.ok)throw new Error(`세그먼트 ${i+1} HTTP ${response.status}`);const data=Buffer.from(await response.arrayBuffer());if(!output.write(data))await new Promise(resolve=>output.once('drain',resolve));event.sender.send('download:progress',{received:i+1,total:segments.length,percent:Math.round((i+1)/segments.length*100)});}}finally{await new Promise(resolve=>output.end(resolve));}
+  // Six segments are on their way at a time (one after another, each waited for, it took as long as the video); they
+  // are written in order, each as soon as it and the ones before it are in.
+  const segment=async i=>{const response=await fetch(segments[i],{headers:{'User-Agent':LINKKF_UA,Referer:playlistUrl}});if(!response.ok)throw new Error(`세그먼트 ${i+1} HTTP ${response.status}`);return Buffer.from(await response.arrayBuffer())};
+  const ahead=[];let asked=0;const fill=()=>{while(asked<segments.length&&ahead.length<6){const next=segment(asked++);next.catch(()=>{});ahead.push(next)}};
+  const output=fs.createWriteStream(filePath);try{for(let i=0;i<segments.length;i++){fill();const data=await ahead.shift();if(!output.write(data))await new Promise(resolve=>output.once('drain',resolve));event.sender.send('download:progress',{received:i+1,total:segments.length,percent:Math.round((i+1)/segments.length*100)});}}finally{await new Promise(resolve=>output.end(resolve));}
 }
 
 function createWindow() {
@@ -2215,7 +2227,7 @@ app.whenReady().then(async () => {
       if(current)data.push(...await ohliAiring());
     } else if (provider === 'linkani') {
       // 이번 시즌 신작: this year's shows, newest update first (two pages); 방영 중: today's weekday.
-      if(current){for(let page=1;page<=2;page++)data.push(...linkaniItems(await linkaniFetch(`${LINKANI_WEB}/list/2/year/${year}/${page>1?`page/${page}/`:''}`)).filter(item=>!data.some(known=>known.mal_id===item.mal_id)));return {data,label:`${year}년`}}
+      if(current){const pages=await Promise.all([1,2].map(page=>linkaniFetch(`${LINKANI_WEB}/list/2/year/${year}/${page>1?`page/${page}/`:''}`)));for(const html of pages)data.push(...linkaniItems(html).filter(item=>!data.some(known=>known.mal_id===item.mal_id)));return {data,label:`${year}년`}}
       data.push(...linkaniItems(await linkaniFetch(`${LINKANI_WEB}/list/2/class/${encodeURIComponent('일월화수목금토'[new Date().getDay()])}/`)));
     } else throw new Error('지원하지 않는 콘텐츠 소스입니다.');
     return {data,label:current?`${year} ${['겨울','봄','여름','가을'][index]}`:''};
@@ -2261,15 +2273,33 @@ app.whenReady().then(async () => {
     }
     throw new Error('지원하지 않는 콘텐츠 소스입니다.');
   });
-  ipcMain.handle('provider:detail', async (_, anime) => {
+  const loadProviderDetail = async anime => {
     if (anime.provider === 'miruro') return miruroDetail(anime);
     if (anime.provider === 'ohli24') return ohliDetail(anime);
     if (anime.provider === 'linkani') return linkaniDetail(anime);
+    if (anime.provider === 'reanime') {
+      // The series route and the episode route go out together; the series page only when one of them fails.
+      let html=null;const page=()=>html??=providerFetch(anime.url,{referer:`${REANIME_WEB}/`});
+      const listed=providerFetch(`${REANIME_WEB}/api/v1/anime/${encodeURIComponent(anime.id)}/episodes?limit=2000`,{json:true,referer:anime.url});listed.catch(()=>{});
+      const detail=await reanimeDetail(anime,page);
+      return {data:detail,episodes:await reanimeEpisodes(detail,page,listed),unavailable:false};
+    }
     const html=await providerFetch(anime.url,{referer:new URL(anime.url).origin+'/'});
-    const detail=anime.provider==='animenosub'?animenosubDetail(html,anime):anime.provider==='reanime'?await reanimeDetail(anime,html):{...anime,synopsis:cheerio.load(html)('meta[name=description]').attr('content')||anime.synopsis};
-    const episodes=anime.provider==='reanime'?await reanimeEpisodes(detail,html):providerEpisodes(html,anime.provider,detail);
+    const detail=anime.provider==='animenosub'?animenosubDetail(html,anime):{...anime,synopsis:cheerio.load(html)('meta[name=description]').attr('content')||anime.synopsis};
+    const episodes=providerEpisodes(html,anime.provider,detail);
     if(anime.provider==='animenosub')detail.availableEpisodes=Math.max(0,...episodes.map(episode=>Number(episode.number)||0));
     return {data:detail,episodes,unavailable:false};
+  };
+  // A series' page is asked for again within moments (the home banner reads it, then opening the series does): the
+  // answer is kept for 5 minutes, and a second ask while the first is on its way waits for it. A failed one is not kept.
+  const providerDetails=new Map();
+  ipcMain.handle('provider:detail', (_, anime) => {
+    const key=`${anime?.provider}|${anime?.url||anime?.id||anime?.mal_id}`,kept=providerDetails.get(key);
+    if(kept&&Date.now()-kept.at<5*60000)return kept.promise;
+    const promise=loadProviderDetail(anime);providerDetails.set(key,{at:Date.now(),promise});
+    promise.catch(()=>{if(providerDetails.get(key)?.promise===promise)providerDetails.delete(key)});
+    if(providerDetails.size>200)providerDetails.delete(providerDetails.keys().next().value);
+    return promise;
   });
   ipcMain.handle('provider:play', (_, episode, title) => openProviderPlayer(episode,title).then(()=>true));
   // The player's own resolves (downloads resolve in the background through resolveProviderEpisode directly).
