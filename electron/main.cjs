@@ -2539,6 +2539,21 @@ app.whenReady().then(async () => {
   ipcMain.handle('open:external', (_, url) => {
     if (/^https:\/\//i.test(url)) return shell.openExternal(url);
   });
+  // 스크린샷 (P): the frame on screen as a PNG in 사진\LilacAnime. The page hands over the frame at the video's own
+  // size; a video it cannot read (another site's file without CORS) is taken from the window instead (rect: where the
+  // picture is, the controls hidden by then).
+  ipcMain.handle('player:screenshot', async (event, { data = '', rect = null, name = '' } = {}) => {
+    let png = /^data:image\/png;base64,/.test(data) ? Buffer.from(data.slice(data.indexOf(',') + 1), 'base64') : null;
+    if (!png && rect) png = (await event.sender.capturePage({ x: Math.round(rect.x), y: Math.round(rect.y), width: Math.max(1, Math.round(rect.width)), height: Math.max(1, Math.round(rect.height)) })).toPNG();
+    if (!png?.length) throw new Error('화면을 찍지 못했습니다.');
+    const dir = path.join(app.getPath('pictures'), 'LilacAnime');
+    fs.mkdirSync(dir, { recursive: true });
+    const base = String(name || 'LilacAnime').normalize('NFKC').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/g, '').trim().slice(0, 150) || 'LilacAnime';
+    let file = path.join(dir, `${base}.png`);
+    for (let n = 2; fs.existsSync(file); n++) file = path.join(dir, `${base} (${n}).png`);
+    fs.writeFileSync(file, png);
+    return { path: file, folder: dir };
+  });
   if(process.env.LILAC_SMOKE_REANIME==='1'){
     try{
       const result=await resolveProviderEpisode({provider:'reanime',url:`${REANIME_WEB}/watch/attack-on-titan-p9y2p9?ep=1`,number:1,anilistId:16498});

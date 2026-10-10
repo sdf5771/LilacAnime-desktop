@@ -175,3 +175,7 @@
 /* Keyboard shortcuts listed under the 재생 tab. */
 .ps-shortcuts { margin: 14px 0 4px; color: #ffffff8c; font-size: 11px; line-height: 1.7; }
 .ps-shortcuts b { color: #ffffffcc; font-weight: 600; margin-right: 6px; }
+
+/* 스크린샷 taken from the window: only the picture, no controls, subtitles or ASS canvas, for that moment. */
+.immersive-player.capturing, .immersive-player.capturing * { visibility: hidden !important; }
+.immersive-player.capturing #videoStage, .immersive-player.capturing #video { visibility: visible !important; }

@@ -100,6 +100,7 @@ contextBridge.exposeInMainWorld('lilac', {
   chooseFont: () => ipcRenderer.invoke('file:font'),
   updateNotes: () => ipcRenderer.invoke('update:notes'),
   openExternal: url => ipcRenderer.invoke('open:external', url),
+  saveScreenshot: request => ipcRenderer.invoke('player:screenshot', request),
   syncStatus: () => ipcRenderer.invoke('device-sync:status'),
   syncConnect: (server, password) => ipcRenderer.invoke('device-sync:connect', server, password),
   syncDisconnect: () => ipcRenderer.invoke('device-sync:disconnect'),

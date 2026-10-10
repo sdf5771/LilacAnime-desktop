@@ -678,7 +678,7 @@ function handlePlayerKey(event) {
   if (letter === 'f') { $('#fullscreenPlayer').click(); showPlayerControls(); return; }
   if (letter === 'm') { $('#mutePlayer').click(); showPlayerControls(); return; }
   // C: subtitles on / off; Z / X: subtitles half a second earlier / later (the 자막 싱크 setting); S: skip the opening or
-  // ending on screen; 0-9: to that tenth of the episode; [ / ]: slower / faster. Each says what it did. (Up and down stay
+  // ending on screen; P: screenshot; 0-9: to that tenth of the episode; [ / ]: slower / faster. Each says what it did. (Up and down stay
   // for moving the focus with a remote.)
   if (letter === 'c') { const box = $('#subtitleEnabled'); box.checked = !box.checked; box.dispatchEvent(new Event('change')); toast(box.checked ? '자막을 켰어요' : '자막을 껐어요'); return; }
   if (letter === 'z' || letter === 'x') {
@@ -686,6 +686,7 @@ function handlePlayerKey(event) {
     setSubtitleSync(next);
     toast(`자막 싱크 ${next > 0 ? '+' : ''}${(next / 1000).toFixed(1)}초 (${next < 0 ? '자막이 빨리 나옴' : next > 0 ? '자막이 늦게 나옴' : '원래대로'})`); return;
   }
+  if (letter === 'p') { takeScreenshot(); return; }
   if (letter === 's') { const skip = $('#skipNow'); if (skip && !skip.classList.contains('hidden')) skip.click(); else toast('지금은 건너뛸 OP/ED 구간이 아니에요'); return; }
   if (/^[0-9]$/.test(letter) && video.duration) { video.currentTime = video.duration * Number(letter) / 10; showPlayerControls(); return; }
   if (letter === '[' || letter === ']') {
@@ -697,6 +698,38 @@ function handlePlayerKey(event) {
   if (key === 'MediaTrackPrevious' || key === 'PageUp') { event.preventDefault(); playSiblingEpisode(siblingEpisode(-1)); return; }
   showPlayerControls();
 }
+
+// 스크린샷 (P, the camera button): the frame on screen at the video's own size (1920×1080 for a 1080p episode, not the
+// window's), without subtitles or controls, as a PNG in 사진\LilacAnime named after the episode and the time in it.
+// A video the page may not read (another site's file without CORS) is taken from the window instead, with the
+// controls and subtitles hidden for that moment: the picture as large as the player shows it.
+async function takeScreenshot() {
+  const video = $('#video');
+  if (!video.videoWidth || video.readyState < 2) { toast('영상이 나온 뒤에 찍을 수 있어요'); return; }
+  const time = typeof formatTime === 'function' ? formatTime(video.currentTime).replace(/:/g, '-') : String(Math.floor(video.currentTime));
+  const name = `${($('#playerTitle').textContent || 'LilacAnime').trim()} ${time}`;
+  let data = '';
+  try {
+    const canvas = document.createElement('canvas'); canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height); data = canvas.toDataURL('image/png');
+  } catch { /* a tainted canvas: taken from the window below */ }
+  let rect = null; const player = $('#immersivePlayer'), shown = [];
+  if (!data) {
+    // Where the picture is inside the video box (letterboxed by object-fit: contain).
+    const box = video.getBoundingClientRect(), scale = video.style.objectFit === 'fill' ? null : Math.min(box.width / video.videoWidth, box.height / video.videoHeight);
+    const width = scale ? video.videoWidth * scale : box.width, height = scale ? video.videoHeight * scale : box.height;
+    rect = { x: box.left + (box.width - width) / 2, y: box.top + (box.height - height) / 2, width, height };
+    for (const track of video.textTracks) if (track.mode === 'showing') { shown.push(track); track.mode = 'hidden'; }
+    player.classList.add('capturing');
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }
+  try {
+    await window.lilac.saveScreenshot({ data, rect, name });
+    toast(`스크린샷을 저장했어요 (사진 > LilacAnime${data ? `, ${video.videoWidth}×${video.videoHeight}` : ''})`);
+  } catch (error) { toast(`스크린샷을 저장하지 못했어요: ${String(error?.message || error).replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '')}`); }
+  finally { player.classList.remove('capturing'); for (const track of shown) track.mode = 'showing'; }
+}
+$('#screenshotPlayer').addEventListener('click', () => { takeScreenshot(); showPlayerControls(); });
 
 // Outside the player the same keys drive focus between cards, tabs and buttons.
 function handleAppKey(event) {
