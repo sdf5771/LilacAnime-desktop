@@ -374,15 +374,13 @@ async function reanimeEpisodes(anime, page, listed = null) {
 
 async function reanimeServers(episode) {
   const parsed=new URL(episode.url),slug=parsed.pathname.split('/').filter(Boolean).pop(),number=Number(parsed.searchParams.get('ep')||episode.number||1);
-  let links=[];
-  try {
-    const root=await providerFetch(`${REANIME_WEB}/api/watch/${encodeURIComponent(slug)}/${number}`,{json:true,referer:`${REANIME_WEB}/`});
-    links=Array.isArray(root.episode_links)?root.episode_links:[];
-  } catch { /* Current API often serves streams only from /api/flix. */ }
-  if(!links.length&&episode.anilistId){
-    const flix=await providerFetch(`${REANIME_WEB}/api/flix/${Number(episode.anilistId)}/${number}`,{json:true,referer:`${REANIME_WEB}/`});
-    links=Array.isArray(flix.servers)?flix.servers:[];
-  }
+  // The current API often serves streams only from /api/flix: both are asked at once (one after the other, an empty
+  // /api/watch cost a whole request first), /api/watch's links used when it has any.
+  const watch=providerFetch(`${REANIME_WEB}/api/watch/${encodeURIComponent(slug)}/${number}`,{json:true,referer:`${REANIME_WEB}/`}).then(root=>Array.isArray(root?.episode_links)?root.episode_links:[],()=>[]);
+  const flix=episode.anilistId?providerFetch(`${REANIME_WEB}/api/flix/${Number(episode.anilistId)}/${number}`,{json:true,referer:`${REANIME_WEB}/`}).then(root=>Array.isArray(root?.servers)?root.servers:[]):null;
+  flix?.catch(()=>{});
+  let links=await watch;
+  if(!links.length&&flix)links=await flix;
   const candidates=links.map(item=>({name:String(item.serverName||''),url:String(item.dataLink||item.link||'')})).filter(item=>/^https:\/\/flixcloud\.cc\/e\//i.test(item.url));
   return [...candidates.filter(item=>/HD-?2/i.test(item.name)),...candidates.filter(item=>/HD-?1/i.test(item.name)),...candidates]
     .filter((item,index,array)=>array.findIndex(x=>x.url===item.url)===index);
@@ -398,6 +396,22 @@ async function reanimeSubtitleTracks(episode) {
   return {tracks:[],referer:''};
 }
 
+// The servers in their order of preference, each started `stagger` ms after the one before it unless that one has
+// answered (or at once when it fails): a host that does not answer no longer holds the next for its whole time limit.
+// The first answer is used and the pages still trying are closed.
+function firstAnswering(items,attempt,stagger){
+  return new Promise((resolve,reject)=>{
+    const controller=new AbortController();let started=0,failed=0,done=false,timer=null,lastError=null;
+    const finish=(error,value)=>{if(done)return;done=true;clearTimeout(timer);controller.abort();error?reject(error):resolve(value)};
+    const next=()=>{
+      clearTimeout(timer);if(done||started>=items.length)return;
+      const item=items[started++];
+      attempt(item,controller.signal).then(value=>finish(null,value),error=>{lastError=error;if(++failed>=items.length)finish(lastError||new Error('모든 영상 서버 연결에 실패했습니다.'));else if(failed>=started)next()});
+      if(started<items.length)timer=setTimeout(next,stagger);
+    };
+    next();
+  });
+}
 async function resolveProviderEpisode(episode) {
   if(episode.provider==='miruro')return resolveMiruroEpisode(episode);
   if(episode.provider==='ohli24')return resolveOhliEpisode(episode);
@@ -405,11 +419,7 @@ async function resolveProviderEpisode(episode) {
   if(episode.provider==='reanime') {
     const ordered=await reanimeServers(episode);
     if(!ordered.length)throw new Error('이 작품은 현재 RE:Anime에서 재생할 수 없습니다. 다른 콘텐츠 소스를 선택해주세요.');
-    let lastError;
-    for(const server of ordered){
-      try{return await resolveStreamPage(server.url,`${REANIME_WEB}/`)}catch(error){lastError=error}
-    }
-    throw lastError||new Error('모든 영상 서버 연결에 실패했습니다.');
+    return firstAnswering(ordered,(server,signal)=>resolveStreamPage(server.url,`${REANIME_WEB}/`,30000,{signal}),6000);
   }
   if(episode.provider==='animenosub'){
     const servers=animenosubServers(await providerFetch(episode.url,{referer:`${ANIMENOSUB_WEB}/`}),episode.url);
@@ -697,10 +707,35 @@ async function ohliDetail(anime){
     year:card.year||anime.year||'',aired:String(info['방영일']||''),type:card.type,status:card.status,url:card.url,availableEpisodes:Math.max(0,...episodes.map(episode=>Number.isInteger(episode.number)?episode.number:0)),totalEpisodes:card.totalEpisodes,episodes:card.totalEpisodes||episodes.length};
   return {data,episodes,unavailable:!episodes.length};
 }
-// The cdndania player hands its master playlist (master.txt) only to its own page: the request needs the cookie the
-// page sets and the page's own headers (no Referer). The variant playlist and the segments it lists are open, so the
-// player page is opened hidden, its master read in its session, and the best variant is what the app plays.
+// The best variant of a master playlist. Its segments come from a different host each (ohli1…7ncloud5-nocdn.xyz), so
+// a download fetches them itself, six at a time (mirror), as Miruro's: FFmpeg opens a new connection for every one.
+function ohliVariant(text,base,userAgent){
+  if(!String(text).startsWith('#EXTM3U'))throw new Error('애니24 영상 재생목록을 받지 못했습니다.');
+  const variants=[...text.matchAll(/#EXT-X-STREAM-INF:([^\r\n]*)\r?\n\s*([^\r\n#][^\r\n]*)/g)].map(match=>({bandwidth:Number(match[1].match(/BANDWIDTH=(\d+)/)?.[1])||0,url:new URL(match[2].trim(),base).href}));
+  if(!variants.length)throw new Error('애니24 영상 화질 목록이 없습니다.');
+  return {url:variants.sort((a,b)=>b.bandwidth-a.bandwidth)[0].url,headers:{'User-Agent':userAgent},referer:'',hls:true,mirror:true};
+}
+// The player (cdndania / michealcdn, FirePlayer) read without opening it: its page names the episode's subtitle file
+// (var playerjsSubtitle = "[뉴게임01]https://…/뉴게임01.srt"), and its getVideo answer has a signed master playlist
+// (securedLink, master.m3u8?md5=…&expires=…) that opens without the page's cookie. Two requests at once, ~0.5 s,
+// instead of the page loading in a hidden window (~2.5 s).
+async function ohliStreamDirect(playerUrl){
+  const origin=new URL(playerUrl).origin,hash=new URL(playerUrl).pathname.split('/').filter(Boolean).pop(),signal=AbortSignal.timeout(20000);
+  const [html,info]=await Promise.all([
+    net.fetch(playerUrl,{signal,headers:{'User-Agent':LINKKF_UA,Referer:`${OHLI24_WEB}/`}}).then(response=>response.ok?response.text():''),
+    net.fetch(`${origin}/player/index.php?data=${encodeURIComponent(hash)}&do=getVideo`,{method:'POST',signal,headers:{'User-Agent':LINKKF_UA,'X-Requested-With':'XMLHttpRequest','Content-Type':'application/x-www-form-urlencoded; charset=UTF-8',Referer:playerUrl,Origin:origin},body:`hash=${encodeURIComponent(hash)}&r=${encodeURIComponent(`${OHLI24_WEB}/`)}`}).then(response=>response.json())]);
+  if(!info?.hls||!/^https?:\/\//i.test(info.securedLink||''))throw new Error('애니24 플레이어가 재생목록을 주지 않았습니다.');
+  const stream=ohliVariant(await (await net.fetch(info.securedLink,{signal,headers:{'User-Agent':LINKKF_UA}})).text(),info.securedLink,LINKKF_UA);
+  const listed=String(html.match(/playerjsSubtitle\s*=\s*"([^"]*)"/)?.[1]||''),files=[...listed.matchAll(/(?:\[[^\]]*\])?\s*(https?:\/\/[^,\s]+)/g)].map(match=>match[1]);
+  return {...stream,subtitle:await ohliSubtitleFile(files,playerUrl,(url,options)=>net.fetch(url,options))};
+}
+// The player page opened hidden, when it cannot be read directly: its master playlist (master.txt) is handed only to
+// the page (the cookie it sets, its own headers), read in its session; the variant playlists and segments are open.
 async function ohliStream(playerUrl){
+  try{return await ohliStreamDirect(playerUrl)}catch{/* the page itself below */}
+  return ohliStreamFromPage(playerUrl);
+}
+async function ohliStreamFromPage(playerUrl){
   const win=new BrowserWindow({show:false,width:960,height:640,webPreferences:{partition:'persist:lilac-ohli24',contextIsolation:true,nodeIntegration:false,sandbox:true,autoplayPolicy:'no-user-gesture-required',backgroundThrottling:false}});
   const ses=win.webContents.session;let master=null,headers=null,media=null,found=()=>{};
   // Done the moment the player asks for its playlist (or a video file), not at the next poll.
@@ -720,12 +755,7 @@ async function ohliStream(playerUrl){
     if(!master)return {url:media,headers:{'User-Agent':LINKKF_UA,Referer:playerUrl},referer:playerUrl,subtitle};
     const userAgent=headers?.['User-Agent']||LINKKF_UA;
     const text=await (await ses.fetch(master,{headers:{'User-Agent':userAgent,Accept:'*/*','Accept-Language':headers?.['Accept-Language']||'ko'}})).text();
-    if(!text.startsWith('#EXTM3U'))throw new Error('애니24 영상 재생목록을 받지 못했습니다.');
-    const variants=[...text.matchAll(/#EXT-X-STREAM-INF:([^\r\n]*)\r?\n\s*([^\r\n#][^\r\n]*)/g)].map(match=>({bandwidth:Number(match[1].match(/BANDWIDTH=(\d+)/)?.[1])||0,url:new URL(match[2].trim(),master).href}));
-    if(!variants.length)throw new Error('애니24 영상 화질 목록이 없습니다.');
-    // Its segments come from a different host each (ohli1…7ncloud5-nocdn.xyz), so a download fetches them itself, six at
-    // a time (mirror), as Miruro's: FFmpeg opens a new connection for every one.
-    return {url:variants.sort((a,b)=>b.bandwidth-a.bandwidth)[0].url,headers:{'User-Agent':userAgent},referer:'',hls:true,mirror:true,subtitle};
+    return {...ohliVariant(text,master,userAgent),subtitle};
   }finally{clearInterval(nudge);clearTimeout(timer);ses.webRequest.onSendHeaders(null);if(!win.isDestroyed())win.destroy()}
 }
 // Most videos have the Korean subtitle in the picture; an older raw one ("[Ohys-Raws] New Game! - 01") comes clean, and
@@ -734,9 +764,13 @@ async function ohliStream(playerUrl){
 // readSubtitleText reads). Nothing when the player has none or the file does not come.
 async function ohliCaption(win,playerUrl){
   const files=await win.webContents.executeJavaScript(`(()=>{try{const item=window.jwplayer?.().getPlaylist?.()?.[0]||{};return [...(item.tracks||[]),...(item.sources||[]).flatMap(source=>source.tracks||[])].filter(track=>/^(captions|subtitles)$/i.test(track.kind||'')&&track.file).map(track=>String(track.file))}catch{return []}})()`,true).catch(()=>[]);
+  return ohliSubtitleFile(files,playerUrl,(url,options)=>win.webContents.session.fetch(url,options));
+}
+// The first of these subtitle files that comes, as {data, ext}.
+async function ohliSubtitleFile(files,playerUrl,fetcher){
   for(const file of new Set(files)){
     try{
-      const url=new URL(file,playerUrl).href,response=await win.webContents.session.fetch(url,{signal:AbortSignal.timeout(20000),headers:{'User-Agent':LINKKF_UA}});
+      const url=new URL(file,playerUrl).href,response=await fetcher(url,{signal:AbortSignal.timeout(20000),headers:{'User-Agent':LINKKF_UA}});
       if(!response.ok)continue;
       const data=Buffer.from(await response.arrayBuffer()),head=data.subarray(0,4096).toString('utf8').replace(/^﻿/,'').trimStart();
       if(!data.length||data.length>=20*1024*1024||/^<(?:!doctype|html|head)/i.test(head))continue;
@@ -893,6 +927,19 @@ async function saveRemoteSubtitle(url,{referer='',userAgent=LINKKF_UA,headers={}
 // Android gives the player WebView 30 s (Re:Anime) or 15 s (Linkkf) to expose the stream.
 // options: partition (a session of its own, so several pages can be resolved at once without swapping each other's
 // request hooks), waitSubtitle (Linkkf pages carry a Korean subtitle requested after the video), signal (stops it).
+// A session has one request hook; a second one replaces the first. Player pages open side by side in one session
+// (Re:Anime's servers, each in the session that keeps FlixCloud's cookies), so the session's hook hands each request
+// to the page it came from.
+const resolverHooks=new Map();
+function hookResolver(ses,webContentsId,handler){
+  let handlers=resolverHooks.get(ses);
+  if(!handlers){
+    handlers=new Map();resolverHooks.set(ses,handlers);
+    ses.webRequest.onBeforeSendHeaders({urls:['*://*/*']},(details,callback)=>{const own=handlers.get(details.webContentsId);if(own)own(details,callback);else callback({requestHeaders:details.requestHeaders})});
+  }
+  handlers.set(webContentsId,handler);
+  return ()=>{handlers.delete(webContentsId);if(!handlers.size&&resolverHooks.get(ses)===handlers){resolverHooks.delete(ses);ses.webRequest.onBeforeSendHeaders(null)}};
+}
 async function resolveStreamPage(targetUrl, referer = '', timeoutMs = 30000, { partition: ownPartition = '', waitSubtitle = true, signal = null } = {}) {
   const isFlixCloud=/flixcloud\.cc/i.test(targetUrl);
   const partition=ownPartition||(isFlixCloud?'persist:lilac-android-webview-v2':'persist:lilac-provider');
@@ -900,8 +947,7 @@ async function resolveStreamPage(targetUrl, referer = '', timeoutMs = 30000, { p
   const resolver=new BrowserWindow({show:false,width:960,height:640,webPreferences:{partition,contextIsolation:true,nodeIntegration:false,sandbox:true,autoplayPolicy:'no-user-gesture-required',backgroundThrottling:false}});
   resolver.webContents.setUserAgent(browserUa);
   const ses=resolver.webContents.session;let stream=null,subtitle=null,lastHeaders={},flixPk='',flixVideo='',flixAudio='';const streams=new Map();
-  const filter={urls:['*://*/*']};
-  ses.webRequest.onBeforeSendHeaders(filter,(details,callback)=>{const lower=details.url.toLowerCase(),headers=details.requestHeaders||{};if(isFlixCloud){headers['User-Agent']=ANDROID_WEBVIEW_UA;headers['sec-ch-ua']='"Chromium";v="131", "Not_A Brand";v="24"';headers['sec-ch-ua-mobile']='?1';headers['sec-ch-ua-platform']='"Android"';headers['Accept-Language']='en-US,en;q=0.9,ko;q=0.7'}const adMedia=/runative|magsrv|juneworewyjyna|pxltag/i.test(lower),media=lower.includes('.m3u8')||/\.(mp4|webm)(?:\?|$)/i.test(lower);if(media&&!adMedia&&!lower.includes('ad')){streams.set(details.url,{...headers});if(!stream){stream=details.url;lastHeaders={...headers}}}if(!isFlixCloud&&lower.includes('.vtt')&&!/thumbnail/i.test(lower))subtitle ||= details.url;callback({requestHeaders:headers});});
+  const unhook=hookResolver(ses,resolver.webContents.id,(details,callback)=>{const lower=details.url.toLowerCase(),headers=details.requestHeaders||{};if(isFlixCloud){headers['User-Agent']=ANDROID_WEBVIEW_UA;headers['sec-ch-ua']='"Chromium";v="131", "Not_A Brand";v="24"';headers['sec-ch-ua-mobile']='?1';headers['sec-ch-ua-platform']='"Android"';headers['Accept-Language']='en-US,en;q=0.9,ko;q=0.7'}const adMedia=/runative|magsrv|juneworewyjyna|pxltag/i.test(lower),media=lower.includes('.m3u8')||/\.(mp4|webm)(?:\?|$)/i.test(lower);if(media&&!adMedia&&!lower.includes('ad')){streams.set(details.url,{...headers});if(!stream){stream=details.url;lastHeaders={...headers}}}if(!isFlixCloud&&lower.includes('.vtt')&&!/thumbnail/i.test(lower))subtitle ||= details.url;callback({requestHeaders:headers});});
   const stop=()=>{if(!resolver.isDestroyed())resolver.destroy()};signal?.addEventListener('abort',stop);
   try {
     // The address is looked for while the page loads: a player page can keep loading ads for half a minute after the
@@ -956,7 +1002,7 @@ async function resolveStreamPage(targetUrl, referer = '', timeoutMs = 30000, { p
     if(isFlixCloud){const keyDeadline=Date.now()+15000;while(!flixPk&&!resolver.isDestroyed()&&Date.now()<keyDeadline){flixPk=await resolver.webContents.executeJavaScript(`window.__pk||''`,true).catch(()=>'');if(!flixPk)await new Promise(resolve=>setTimeout(resolve,250))}if(!flixPk)throw new Error(resolver.isDestroyed()?'플레이어 창이 닫혀 복호화 키 탐색을 중단했습니다.':'FlixCloud 복호화 키를 찾지 못했습니다.');const headers={...lastHeaders,Referer:targetUrl,'User-Agent':ANDROID_WEBVIEW_UA};stream=flixVideo&&flixAudio?await createFlixAvProxyUrl(flixVideo,flixAudio,flixPk,headers):await createFlixProxyUrl(stream,flixPk,headers);}
     let subtitleUrl=subtitle,subtitlePath=null,subtitleAss=null;if(subtitle){try{const saved=subtitleResult(await saveRemoteSubtitle(subtitle,{referer:targetUrl,userAgent:browserUa,headers:lastHeaders}));subtitleUrl=saved.url;subtitlePath=saved.path;subtitleAss=saved.assUrl?{url:saved.assUrl,path:saved.assPath}:null}catch{/* Community subtitle fallback remains available. */}}
     resolvedStreamHeaders.set(new URL(stream).host,{...lastHeaders,Referer:targetUrl});return {url:stream,subtitleUrl,subtitlePath,subtitleAss,subtitleTracks,headers:lastHeaders,referer:targetUrl};
-  } finally {signal?.removeEventListener('abort',stop);ses.webRequest.onBeforeSendHeaders(null);if(!resolver.isDestroyed())resolver.destroy();}
+  } finally {signal?.removeEventListener('abort',stop);unhook();if(!resolver.isDestroyed())resolver.destroy();}
 }
 
 function simpleTitle(value=''){return value.toLowerCase().normalize('NFKC').replace(/\[[^\]]*]|\([^)]*\)/g,' ').replace(/\b(?:subtitle|sub)\b|(?:한글|한국어)?\s*자막/gi,' ').replace(/[^a-z0-9가-힣]+/g,' ').trim()}

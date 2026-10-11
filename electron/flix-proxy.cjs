@@ -18,28 +18,37 @@ function findTs(body){const limit=Math.min(body.length-376,4096);for(let i=1;i<l
 // The CDN behind FlixCloud is reached through a far-away edge that gives each file a few hundred KB/s and now and
 // then stalls a request for a minute. It answers ranges, so a segment is fetched as several ranges at once, a range
 // that is slow to arrive is asked for again alongside, and several segments ahead of playback are on the way at once.
-const PART=1024*1024,PARTS=6,AHEAD=5,KEEP=16,HEDGE_MS=8000;
+// The first range is small (PROBE): it only has to tell the segment's size before the rest can be split up (a whole
+// first MB took ~3 s alone before anything else went out); the rest goes in half-MB ranges, six at a time.
+const PROBE=256*1024,PART=512*1024,PARTS=6,AHEAD=5,KEEP=16,HEDGE_MS=8000,STALL_MS=3000;
 const ahead=new Map();
-// One range, asked for up to three times (the next one after HEDGE_MS, or at once when one fails); the first good
-// answer is used and the rest are stopped.
-function fetchHedged(target,headers,start,end){return new Promise((resolve,reject)=>{
-  const controllers=[];let pending=0,timer=null,settled=false,lastError=null;
-  const finish=(error,result)=>{if(settled)return;settled=true;clearTimeout(timer);controllers.forEach(controller=>controller.abort());error?reject(error):resolve(result)};
+// One range, asked for up to three times; the first good answer is used and the rest are stopped. Another ask goes
+// out when one fails, when one has had nothing for STALL_MS (the stalls last a minute; a slow ask that is still
+// receiving is left alone, which a fixed wait could not tell apart, so it had to be long), or after HEDGE_MS in all.
+function fetchHedged(target,headers,start,end,stallMs=STALL_MS,hedgeMs=HEDGE_MS){return new Promise((resolve,reject)=>{
+  const controllers=[],quiet=new Set();let pending=0,timer=null,settled=false,lastError=null;
+  const finish=(error,result)=>{if(settled)return;settled=true;clearTimeout(timer);quiet.forEach(clearTimeout);controllers.forEach(controller=>controller.abort());error?reject(error):resolve(result)};
   const launch=()=>{
     if(settled)return;
     if(controllers.length>=3){if(!pending)finish(lastError);return}
     const controller=new AbortController();controllers.push(controller);pending++;
-    clearTimeout(timer);timer=setTimeout(launch,HEDGE_MS);
+    clearTimeout(timer);timer=setTimeout(launch,hedgeMs);
+    // This ask's silence watch: it starts the next ask once, the first time nothing has come for stallMs.
+    let silence=null,stalled=false;const heard=()=>{clearTimeout(silence);quiet.delete(silence);if(stalled)return;silence=setTimeout(()=>{stalled=true;launch()},stallMs);quiet.add(silence)};
+    heard();
     fetch(target,{headers:{...headers,range:`bytes=${start}-${end}`},signal:controller.signal}).then(async response=>{
-      const body=Buffer.from(await response.arrayBuffer());
+      heard();const chunks=[],reader=response.body.getReader();
+      for(;;){const {done,value}=await reader.read();if(done)break;chunks.push(Buffer.from(value));heard()}
+      clearTimeout(silence);
+      const body=Buffer.concat(chunks);
       if(start>0?response.status!==206||body.length!==end-start+1:!response.ok)throw new Error(`영상 조각을 받지 못했습니다 (${response.status}).`);
       finish(null,{response,body});
-    }).catch(error=>{pending--;lastError=error;if(!pending)launch()});
+    }).catch(error=>{clearTimeout(silence);pending--;lastError=error;if(!pending)launch()});
   };
   launch();
 })}
 async function fetchRanges(target,headers){
-  const {response:first,body:head}=await fetchHedged(target,headers,0,PART-1),total=Number(first.headers.get('content-range')?.split('/')[1]);
+  const {response:first,body:head}=await fetchHedged(target,headers,0,PROBE-1),total=Number(first.headers.get('content-range')?.split('/')[1]);
   if(first.status!==206||!(total>head.length))return {upstream:first,raw:head};
   const ranges=[];for(let start=head.length;start<total;start+=PART)ranges.push([start,Math.min(start+PART,total)-1]);
   const parts=new Array(ranges.length);let next=0;
@@ -74,4 +83,4 @@ async function createFlixProxyUrl(url,pk,headers={}){await ensureServer();const 
 async function createFlixAvProxyUrl(videoUrl,audioUrl,pk,headers={}){await ensureServer();const id=crypto.randomUUID().replaceAll('-','');sessions.set(id,{pk,headers,videoUrl,audioUrl,order:new Map()});return `http://127.0.0.1:${server.address().port}/__flix/${id}/master.m3u8`}
 function closeFlixProxy(){sessions.clear();ahead.clear();server?.close();server=null}
 
-module.exports={createFlixProxyUrl,createFlixAvProxyUrl,closeFlixProxy};
+module.exports={createFlixProxyUrl,createFlixAvProxyUrl,closeFlixProxy,fetchHedged};
