@@ -8,7 +8,7 @@ let playerLocked = false, unlockTimer = null, usingKeyboard = false;
 // Focus is only moved into menus for keyboard/remote users; mouse users would just see a stray focus ring.
 window.addEventListener('keydown', () => { usingKeyboard = true; }, true);
 window.addEventListener('pointerdown', () => { usingKeyboard = false; }, true);
-const autoSkipState = { enteredKey: null, enteredAt: 0, skippedKey: null };
+const autoSkipState = { enteredKey: null, enteredAt: 0, skippedKey: null, manualSeekTime: null };
 
 const PLAYER_ASPECTS = { original: 0, '16:9': 16 / 9, '21:9': 21 / 9, '4:3': 4 / 3, fill: 0 };
 function playerAspect() {
@@ -373,13 +373,26 @@ async function playSiblingEpisode(episode) {
   await resolveIntoPlayer(() => context.resolveKind === 'linkkf' ? window.lilac.linkkfResolve(episode) : window.lilac.providerResolve(episode), `${title} · ${episode.name || episode.number}화`, context, title, episodeNumberOf(episode) || 1);
 }
 
+// Explicit seeks let the viewer watch the destination segment until they leave it.
+function seekPlayer(time) {
+  if (!Number.isFinite(time)) return;
+  autoSkipState.manualSeekTime = time;
+  $('#video').currentTime = time;
+}
+function resetAutoSkipState() {
+  Object.assign(autoSkipState, { enteredKey: null, enteredAt: 0, skippedKey: null, manualSeekTime: null });
+}
+
 // Android auto skip: the skip pill stays visible for 2.5 s before an OP/ED is skipped automatically.
 function updateSkipState(video) {
   const showButton = playerFlag('playerSkipButton');
   $('#skipNow').classList.toggle('hidden', !activeSkip || !showButton);
-  if (!activeSkip) { autoSkipState.enteredKey = null; autoSkipState.skippedKey = null; return; }
+  if (!activeSkip) { autoSkipState.enteredKey = null; autoSkipState.skippedKey = null; autoSkipState.manualSeekTime = null; return; }
   if (autoSkipState.enteredKey !== activeSkipKey) { autoSkipState.enteredKey = activeSkipKey; autoSkipState.enteredAt = Date.now(); autoSkipState.skippedKey = null; }
-  if (playerFlag('playerAutoSkip', false) && autoSkipState.skippedKey !== activeSkipKey && Date.now() - autoSkipState.enteredAt >= 2500 && activeSkip.endTime > video.currentTime) {
+  const manualTime = autoSkipState.manualSeekTime;
+  const manuallyEntered = manualTime !== null && manualTime >= activeSkip.startTime && manualTime < activeSkip.endTime;
+  if (!manuallyEntered) autoSkipState.manualSeekTime = null;
+  if (!manuallyEntered && playerFlag('playerAutoSkip', false) && autoSkipState.skippedKey !== activeSkipKey && Date.now() - autoSkipState.enteredAt >= 2500 && activeSkip.endTime > video.currentTime) {
     autoSkipState.skippedKey = activeSkipKey; video.currentTime = activeSkip.endTime;
   }
 }
@@ -532,9 +545,9 @@ if ('mediaSession' in navigator) {
   navigator.mediaSession.setActionHandler('play', () => video.play());
   navigator.mediaSession.setActionHandler('pause', () => video.pause());
   navigator.mediaSession.setActionHandler('stop', () => video.pause());
-  navigator.mediaSession.setActionHandler('seekbackward', details => { video.currentTime = Math.max(0, video.currentTime - (details.seekOffset || seconds())); });
-  navigator.mediaSession.setActionHandler('seekforward', details => { video.currentTime = Math.min(video.duration || Infinity, video.currentTime + (details.seekOffset || seconds())); });
-  navigator.mediaSession.setActionHandler('seekto', details => { if (Number.isFinite(details.seekTime)) video.currentTime = details.seekTime; });
+  navigator.mediaSession.setActionHandler('seekbackward', details => { seekPlayer(Math.max(0, video.currentTime - (details.seekOffset || seconds()))); });
+  navigator.mediaSession.setActionHandler('seekforward', details => { seekPlayer(Math.min(video.duration || Infinity, video.currentTime + (details.seekOffset || seconds()))); });
+  navigator.mediaSession.setActionHandler('seekto', details => { if (Number.isFinite(details.seekTime)) seekPlayer(details.seekTime); });
   video.addEventListener('playing', () => { navigator.mediaSession.playbackState = 'playing'; updateMediaSession(); updateMediaPosition(); });
   video.addEventListener('pause', () => { navigator.mediaSession.playbackState = 'paused'; updateMediaPosition(); });
   video.addEventListener('durationchange', updateMediaPosition);
@@ -662,7 +675,7 @@ function handlePlayerKey(event) {
   if (arrow === 'left' || arrow === 'right') {
     event.preventDefault();
     const seconds = Number(localStorage.getItem('seekSeconds') || 10) * (arrow === 'left' ? -1 : 1);
-    video.currentTime = Math.min(video.duration || Infinity, Math.max(0, video.currentTime + seconds)); showPlayerControls(); return;
+    seekPlayer(Math.min(video.duration || Infinity, Math.max(0, video.currentTime + seconds))); showPlayerControls(); return;
   }
   if (arrow) { event.preventDefault(); showPlayerControls(); $('#togglePlayer').focus(); return; }
   if (event.code === 'Space' || key === ' ') {
@@ -688,7 +701,7 @@ function handlePlayerKey(event) {
   }
   if (letter === 'p') { takeScreenshot(); return; }
   if (letter === 's') { const skip = $('#skipNow'); if (skip && !skip.classList.contains('hidden')) skip.click(); else toast('지금은 건너뛸 OP/ED 구간이 아니에요'); return; }
-  if (/^[0-9]$/.test(letter) && video.duration) { video.currentTime = video.duration * Number(letter) / 10; showPlayerControls(); return; }
+  if (/^[0-9]$/.test(letter) && video.duration) { seekPlayer(video.duration * Number(letter) / 10); showPlayerControls(); return; }
   if (letter === '[' || letter === ']') {
     finishSpaceHold(false);
     const at = SPEED_OPTIONS.indexOf(video.playbackRate), next = SPEED_OPTIONS[Math.max(0, Math.min(SPEED_OPTIONS.length - 1, (at < 0 ? SPEED_OPTIONS.indexOf(1) : at) + (letter === ']' ? 1 : -1)))];

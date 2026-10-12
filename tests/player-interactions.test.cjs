@@ -265,3 +265,34 @@ test('a slower earlier subtitle search does not replace the source or maker pick
   assert.deepEqual(attached, ['csora', 'anissia · B']);
   assert.equal($('#subtitleState').textContent, 'Anissia · B 자막을 찾는 중...');
 });
+
+test('manual seeks suppress only the destination skip segment and reset for a new video', () => {
+  let now = 0;
+  const video = { currentTime: 0 }, pill = { classList: classList() };
+  const context = vm.createContext({
+    autoSkipState: { enteredKey: null, enteredAt: 0, skippedKey: null, manualSeekTime: null },
+    activeSkip: null, activeSkipKey: null,
+    $: selector => selector === '#video' ? video : pill,
+    playerFlag: () => true, Date: { now: () => now }
+  });
+  vm.runInContext(section('// Explicit seeks', 'function setPlayerLocked'), context);
+  const op = { startTime: 10, endTime: 90 }, ed = { startTime: 200, endTime: 260 };
+  const update = (segment, time) => {
+    video.currentTime = time; context.activeSkip = segment;
+    context.activeSkipKey = segment === op ? 'op' : segment === ed ? 'ed' : null;
+    context.updateSkipState(video);
+  };
+  update(op, 10); now += 3000; update(op, 13);
+  assert.equal(video.currentTime, 90, 'normal playback skips');
+  context.seekPlayer(20); update(op, 20); now += 3000; update(op, 23);
+  assert.equal(video.currentTime, 23, 'seeking back into an already skipped OP allows watching');
+  assert.equal(pill.classList.contains('hidden'), false, 'manual skip remains available');
+  context.seekPlayer(30); now += 3000; update(op, 33);
+  assert.equal(video.currentTime, 33, 'seeking within the segment keeps the exemption');
+  update(null, 100); update(ed, 200); now += 3000; update(ed, 203);
+  assert.equal(video.currentTime, 260, 'later segment still skips');
+  context.seekPlayer(5); update(null, 5); update(op, 10); now += 3000; update(op, 13);
+  assert.equal(video.currentTime, 90, 'seeking before the segment allows normal auto skip');
+  context.seekPlayer(20); context.resetAutoSkipState(); update(op, 20); now += 3000; update(op, 23);
+  assert.equal(video.currentTime, 90, 'new playback clears the exemption');
+});
