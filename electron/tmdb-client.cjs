@@ -12,30 +12,44 @@ function tmdbError(code, status = 0, retryAfterMs = 0) {
   return Object.assign(new Error(messages[code]), { code, status, retryAfterMs });
 }
 
-// All callers share request spacing and a 429 cooldown, including foreground searches.
-function createTmdbClient({ fetch = globalThis.fetch, now = Date.now, sleep = wait, interval = 150 } = {}) {
-  let gate = Promise.resolve(), nextRequestAt = 0, blockedUntil = 0;
-  async function takeTurn() {
-    const previous = gate; let release;
-    gate = new Promise(resolve => { release = resolve; });
-    await previous;
+// All callers share request spacing and a 429 cooldown. Requests made for the screen go first and are spaced by
+// `interval` (TMDB allows about 50 a second); the catalog index's background lookups only start when no screen request
+// waits, spaced by `backgroundInterval`. The same request asked again while it runs shares that request, and a screen
+// request's answer is kept for `cacheTtl` (the background ones are kept by the catalog index itself).
+function createTmdbClient({ fetch = globalThis.fetch, now = Date.now, sleep = wait, interval = 40, backgroundInterval = 150,
+  cacheTtl = 6 * 60 * 60 * 1000, cacheSize = 500 } = {}) {
+  const lanes = { front: [], back: [] }, inflight = new Map(), cache = new Map();
+  let lastStart = -Infinity, blockedUntil = 0, pumping = false;
+  async function pump() {
+    if (pumping) return; pumping = true;
     try {
-      while (Math.max(nextRequestAt, blockedUntil) > now()) {
-        const delay = Math.max(nextRequestAt, blockedUntil) - now();
+      while (lanes.front.length || lanes.back.length) {
         // Long server cooldowns are handed back to the catalog scheduler, not held open here.
-        if (blockedUntil - now() > 30000) throw tmdbError('rate-limit', 429, blockedUntil - now());
-        await sleep(delay);
+        if (blockedUntil - now() > 30000) {
+          for (const ticket of lanes.front.splice(0).concat(lanes.back.splice(0))) ticket.reject(tmdbError('rate-limit', 429, blockedUntil - now()));
+          break;
+        }
+        const back = !lanes.front.length, ready = Math.max(lastStart + (back ? backgroundInterval : interval), blockedUntil);
+        // A screen request that comes in meanwhile is looked at again after this wait.
+        if (ready > now()) { await sleep(ready - now()); continue; }
+        lastStart = now();
+        (back ? lanes.back : lanes.front).shift().resolve();
       }
-      nextRequestAt = now() + interval;
-    } finally { release(); }
+    } finally { pumping = false; }
   }
-  return async function request(pathname, params = {}, key = '') {
-    if (!key) throw tmdbError('auth');
-    const url = new URL(`https://api.themoviedb.org/3${pathname}`), bearer = key.includes('.');
-    for (const [name, value] of Object.entries(params)) url.searchParams.set(name, value);
-    if (!bearer) url.searchParams.set('api_key', key);
+  function takeTurn(ticket) {
+    return new Promise((resolve, reject) => { Object.assign(ticket, { resolve, reject }); (ticket.background ? lanes.back : lanes.front).push(ticket); pump(); });
+  }
+  // A background request still waiting moves to the screen lane when the screen asks for the same thing.
+  function promote(ticket) {
+    if (!ticket.background) return;
+    ticket.background = false;
+    const index = lanes.back.indexOf(ticket);
+    if (index >= 0) { lanes.back.splice(index, 1); lanes.front.push(ticket); pump(); }
+  }
+  async function send(url, key, bearer, ticket) {
     for (let attempt = 0; ; attempt++) {
-      await takeTurn();
+      await takeTurn(ticket);
       let failure;
       try {
         const response = await fetch(url, { signal: AbortSignal.timeout(20000), headers: {
@@ -59,6 +73,27 @@ function createTmdbClient({ fetch = globalThis.fetch, now = Date.now, sleep = wa
       if (!transient || attempt >= 2 || delay > 30000) throw failure;
       if (failure.status !== 429) await sleep(delay);
     }
+  }
+  return async function request(pathname, params = {}, key = '', { background = false } = {}) {
+    if (!key) throw tmdbError('auth');
+    const url = new URL(`https://api.themoviedb.org/3${pathname}`), bearer = key.includes('.');
+    for (const [name, value] of Object.entries(params)) url.searchParams.set(name, value);
+    if (!bearer) url.searchParams.set('api_key', key);
+    const id = `${bearer ? key : ''} ${url}`, cached = cache.get(id);
+    if (cached && now() - cached.time < cacheTtl) return cached.value;
+    if (cached) cache.delete(id);
+    let running = inflight.get(id);
+    if (running) { if (!background) promote(running.ticket); return running.promise; }
+    running = { ticket: { background } };
+    running.promise = send(url, key, bearer, running.ticket).then(value => {
+      if (!running.ticket.background) {
+        cache.set(id, { value, time: now() });
+        if (cache.size > cacheSize) cache.delete(cache.keys().next().value);
+      }
+      return value;
+    }).finally(() => inflight.delete(id));
+    inflight.set(id, running);
+    return running.promise;
   };
 }
 

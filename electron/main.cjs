@@ -1092,8 +1092,9 @@ function readKoreanTitleCache(){try{return JSON.parse(fs.readFileSync(koreanTitl
 function tmdbSettingsFile(){return path.join(app.getPath('userData'),'tmdb.json')}
 function tmdbKey(){try{return String(JSON.parse(fs.readFileSync(tmdbSettingsFile(),'utf8')).key||'').trim()}catch{return ''}}
 const tmdbRequest=createTmdbClient();
-async function tmdbFetch(pathname,params={},key=tmdbKey()){
-  return tmdbRequest(pathname,params,key);
+// background: a catalog index lookup, which gives way to the requests made for the screen (see createTmdbClient).
+async function tmdbFetch(pathname,params={},{key=tmdbKey(),background=false}={}){
+  return tmdbRequest(pathname,params,key,{background});
 }
 // TMDB keeps seasons inside one series, so season words are dropped; a subtitle after ":" is dropped on a
 // second try ("Ascendance of a Bookworm: Adopted Daughter of an Archduke" is listed as the series).
@@ -1112,13 +1113,16 @@ function siblingTitle(main,other){
 // "…Bunny Girl Senpai"). When the English title matches a named season, that season's Korean name is used;
 // a ko-KR name that is only a subtitle ("시즌 2: 영주의 양녀") is appended to the series name. Seasons named
 // just "Season N" are left to the series name and the season number in the English title.
-async function tmdbSeasonTitle(id,original){
-  const [en,ko]=await Promise.all([tmdbFetch(`/tv/${id}`,{language:'en-US'}),tmdbFetch(`/tv/${id}`,{language:'ko-KR'})]);
+async function tmdbSeasonTitle(id,original,options={}){
+  // The ko-KR entry is only asked for when the title names one of the seasons.
+  const en=await tmdbFetch(`/tv/${id}`,{language:'en-US'},options);
   const key=titleCompareKey(original);
   // Season 1 is often named after the series, which every later title also contains: take the longest match.
   const season=(en.seasons||[]).filter(item=>!/^(?:season\s*\d+|specials)$/i.test(item.name||'')&&titleCompareKey(item.name).length>=6&&key.includes(titleCompareKey(item.name))).sort((a,b)=>titleCompareKey(b.name).length-titleCompareKey(a.name).length)[0];
+  if(!season)return '';
+  const ko=await tmdbFetch(`/tv/${id}`,{language:'ko-KR'},options);
   const name=String((ko.seasons||[]).find(item=>item.season_number===season?.season_number)?.name||'').replace(/^시즌\s*\d+\s*[:：]?\s*/,'').trim();
-  if(!season||!/[가-힣]{2}/.test(name))return '';
+  if(!/[가-힣]{2}/.test(name))return '';
   const series=String(ko.name||'').trim(),firstWord=simpleTitle(series).split(' ')[0]||'';
   return firstWord&&simpleTitle(name).includes(firstWord)?name:`${series.replace(/\s*[~〜～][^~〜～]*[~〜～]\s*/g,' ').trim()} ${name}`;
 }
@@ -1136,25 +1140,26 @@ function tmdbQueries(titles){
 // the work (TMDB can rank a spin-off such as "Attack on Titan: Junior High" first). An animation named exactly like the
 // query, otherwise TMDB's own ranking with Japanese works first: "Grand Blue" is listed as "Grand Blue Dreaming", and a
 // prefix match would pick the unrelated "Grand Blues!".
-async function tmdbPick(query,kind){
-  const [enRoot,koRoot]=await Promise.all([tmdbFetch(`/search/${kind}`,{query,language:'en-US',include_adult:'false'}),tmdbFetch(`/search/${kind}`,{query,language:'ko-KR',include_adult:'false'})]);
+async function tmdbPick(query,kind,options={}){
+  const [enRoot,koRoot]=await Promise.all([tmdbFetch(`/search/${kind}`,{query,language:'en-US',include_adult:'false'},options),tmdbFetch(`/search/${kind}`,{query,language:'ko-KR',include_adult:'false'},options)]);
   const japanese=item=>Number(item.origin_country?.includes?.('JP')||item.original_language==='ja');
   const animation=(enRoot?.results||[]).filter(item=>(item.genre_ids||[]).includes(16)),wantedKey=titleCompareKey(query),nameKey=item=>titleCompareKey(item.name||item.title||'');
   const pick=animation.find(item=>nameKey(item)===wantedKey)||animation.slice().sort((a,b)=>japanese(b)-japanese(a))[0];
   return pick?(koRoot?.results||[]).find(item=>item.id===pick.id)||pick:null;
 }
-async function tmdbKoreanTitles(titles,{light=false}={}){
+async function tmdbKoreanTitles(titles,{light=false,background=false}={}){
+  const options={background};
   const found=[];
   for(const query of tmdbQueries(titles)){
     for(const kind of ['tv','movie']){
-      const pick=await tmdbPick(query,kind),results=pick?[pick]:[];
+      const pick=await tmdbPick(query,kind,options),results=pick?[pick]:[];
       // Everything after the first title must not name another season of the same franchise.
       const add=name=>{name=String(name||'').trim();if(/[가-힣]{2}/.test(name)&&!found.includes(name)&&!siblingTitle(found[0],name))found.push(name)};
-      if(kind==='tv'&&results[0])add(await tmdbSeasonTitle(results[0].id,titles[0]).catch(()=>''));
+      if(kind==='tv'&&results[0])add(await tmdbSeasonTitle(results[0].id,titles[0],options).catch(()=>''));
       if(results[0]&&/[가-힣]/.test(results[0].name||results[0].title||''))add(results[0].name||results[0].title);
       // Fan subtitle blogs often use a different Korean title than the official one
       // ("봇치 더 록!" rather than "외톨이 THE ROCK!"); TMDB lists those as Korean alternative titles.
-      if(results[0]&&!light){const alt=await tmdbFetch(`/${kind}/${results[0].id}/alternative_titles`).catch(()=>null);for(const item of [...(alt?.results||[]),...(alt?.titles||[])])if(item.iso_3166_1==='KR')add(item.title)}
+      if(results[0]&&!light){const alt=await tmdbFetch(`/${kind}/${results[0].id}/alternative_titles`,{},options).catch(()=>null);for(const item of [...(alt?.results||[]),...(alt?.titles||[])])if(item.iso_3166_1==='KR')add(item.title)}
       if(found.length)return found;
     }
   }
@@ -1440,7 +1445,7 @@ async function lookupCatalogKorean(provider){
         // A failed series-page request must not cache a miss for an incomplete slug title.
         if(item.slugTitle){await CATALOGS[provider].title?.(item);titled=true}
         stage='tmdb';
-        const ko=(await tmdbKoreanTitles([item.title],{light:true})).find(hasHangul);
+        const ko=(await tmdbKoreanTitles([item.title],{light:true,background:true})).find(hasHangul);
         index.tried[item.id]={time:Date.now()};if(ko)storeIndexKorean(provider,item,ko,'tmdb');
       }catch(error){
         failed=true;
@@ -2584,7 +2589,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('catalog-index:state',()=>catalogIndexState());
   ipcMain.handle('tmdb:set',async(_,value='')=>{
     const key=String(value||'').trim();
-    if(key)await tmdbFetch('/configuration',{},key);
+    if(key)await tmdbFetch('/configuration',{},{key});
     fs.writeFileSync(tmdbSettingsFile(),JSON.stringify({key}),'utf8');koreanTitleCache.clear();for(const [name,entry] of Object.entries(displayTitleStore()))if(!entry.ko||!entry.en)delete displayTitleStore()[name];saveDisplayTitles();
     if(key)buildCatalogIndexes().catch(()=>{});
     return {key};

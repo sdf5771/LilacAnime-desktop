@@ -37,11 +37,42 @@ test('TMDB uses query authentication for v3 keys and bearer authentication for v
   assert.equal(calls[1].options.headers.Authorization, 'Bearer v4.read.token');
 });
 
-test('concurrent catalog and foreground requests share start spacing', async () => {
+test('screen requests are spaced by 40 ms and background ones by 150 ms', async () => {
   const h = harness(async () => ok());
-  await h.run(Promise.all(Array.from({ length: 12 }, () => h.request('/search/tv', {}, 'key'))));
+  await h.run(Promise.all(Array.from({ length: 12 }, (_, i) => h.request('/search/tv', { query: String(i) }, 'key'))));
   assert.equal(h.starts.length, 12);
-  for (let i = 1; i < h.starts.length; i++) assert.ok(h.starts[i] - h.starts[i - 1] >= 150);
+  for (let i = 1; i < h.starts.length; i++) assert.ok(h.starts[i] - h.starts[i - 1] >= 40);
+  assert.ok(h.starts[11] - h.starts[0] < 11 * 100);
+  const b = harness(async () => ok());
+  await b.run(Promise.all(Array.from({ length: 6 }, (_, i) => b.request('/search/tv', { query: String(i) }, 'key', { background: true }))));
+  for (let i = 1; i < b.starts.length; i++) assert.ok(b.starts[i] - b.starts[i - 1] >= 150);
+});
+
+test('screen requests go ahead of waiting background lookups', async () => {
+  const order = [], h = harness(async url => { order.push(url.searchParams.get('query')); return ok(); });
+  const background = Array.from({ length: 5 }, (_, i) => h.request('/search/tv', { query: `bg${i}` }, 'key', { background: true }));
+  const screen = h.request('/search/tv', { query: 'screen' }, 'key');
+  await h.run(Promise.all([...background, screen]));
+  assert.ok(order.indexOf('screen') <= 1, order.join());
+});
+
+test('the same request shares one call while it runs and a screen answer is reused', async () => {
+  let calls = 0; const h = harness(async () => { calls++; return { ok: true, json: async () => ({ id: calls }) }; });
+  const [a, b] = await h.run(Promise.all([h.request('/tv/1', { language: 'ko-KR' }, 'key'), h.request('/tv/1', { language: 'ko-KR' }, 'key')]));
+  assert.equal(calls, 1); assert.deepEqual(a, b);
+  assert.deepEqual(await h.run(h.request('/tv/1', { language: 'ko-KR' }, 'key')), { id: 1 }); assert.equal(calls, 1);
+  await h.run(h.request('/tv/1', { language: 'en-US' }, 'key')); assert.equal(calls, 2);
+  h.advance(6 * 60 * 60 * 1000); await h.run(h.request('/tv/1', { language: 'ko-KR' }, 'key')); assert.equal(calls, 3);
+  await h.run(h.request('/tv/2', {}, 'key', { background: true })); await h.run(h.request('/tv/2', {}, 'key', { background: true })); assert.equal(calls, 5);
+});
+
+test('a screen request for a waiting background lookup moves it ahead', async () => {
+  const order = [], h = harness(async url => { order.push(url.searchParams.get('query')); return ok(); });
+  const background = Array.from({ length: 5 }, (_, i) => h.request('/search/tv', { query: `bg${i}` }, 'key', { background: true }));
+  const screen = h.request('/search/tv', { query: 'bg4' }, 'key');
+  await h.run(Promise.all([...background, screen]));
+  assert.equal(order.filter(query => query === 'bg4').length, 1);
+  assert.ok(order.indexOf('bg4') <= 1, order.join());
 });
 
 test('temporary HTTP, network, timeout and JSON errors recover within the same request', async () => {
@@ -85,7 +116,7 @@ test('a 429 cooldown applies to queued requests as well as the failed request', 
   await h.run(Promise.all([h.request('/search/tv', {}, 'key'), h.request('/search/movie', {}, 'key')]));
   assert.equal(calls, 3);
   assert.ok(h.starts[1] - h.starts[0] >= 3000);
-  assert.ok(h.starts[2] - h.starts[1] >= 150);
+  assert.ok(h.starts[2] - h.starts[1] >= 40);
 });
 
 test('Retry-After HTTP dates and long cooldowns are respected without holding requests open', async () => {
