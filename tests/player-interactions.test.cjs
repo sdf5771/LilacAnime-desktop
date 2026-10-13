@@ -266,6 +266,22 @@ test('a slower earlier subtitle search does not replace the source or maker pick
   assert.equal($('#subtitleState').textContent, 'Anissia · B 자막을 찾는 중...');
 });
 
+test('the Re:Anime chip puts on the site track without a Korean one instead of a machine translation', async () => {
+  const elements = {}, $ = selector => (elements[selector] ||= { value: '', textContent: '' });
+  const english = { label: 'English (Full Subtitles)', url: 'en' }, signs = { label: 'English (Signs & Songs)', url: 'ss' }, picked = [], aiPrefs = [];
+  let translations = 0, savedApplied = 0;
+  const context = vm.createContext({ $, localStorage: { setItem() {} }, playbackRequestId: 1, currentPlaybackContext: { subtitleTracks: [signs, english] }, currentSubtitle: null,
+    KOREAN_SOURCES: ['kairan', 'csora', 'anissia'], SUBTITLE_SOURCE_LABELS: {},
+    window: { lilac: { savedSubtitles: async () => [{ source: 'gemini', path: 'ai.vtt' }] } },
+    subtitleStoreKey: () => 'key', pressSubtitleSource() {}, renderSubtitleSheet() {}, preferAiSubtitle: on => aiPrefs.push(on), syncSettingChoices() {}, syncPlayerSettingsUI() {},
+    isKoreanTrack: track => /korean/i.test(track.label), translationSourceTrack: () => english, selectSubtitleTrack: track => picked.push(track.url),
+    applySavedSubtitle: () => savedApplied++, autoTranslate: async () => { translations++; return true; }, trackSourceLabel: () => 'Re:Anime' });
+  vm.runInContext(section('// Each chip press', '// Quality:'), context);
+  await context.switchSubtitleSource('reanime');
+  assert.deepEqual(picked, ['en']); assert.equal(translations, 0); assert.equal(savedApplied, 0); assert.deepEqual(aiPrefs, [false]);
+  assert.equal(context.currentPlaybackContext.sheetSource, 'reanime');
+});
+
 test('manual seeks suppress only the destination skip segment and reset for a new video', () => {
   let now = 0;
   const video = { currentTime: 0 }, pill = { classList: classList() };

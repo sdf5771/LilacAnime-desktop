@@ -254,15 +254,13 @@ async function switchSubtitleSource(source) {
   if ($('#subtitleSource')) { $('#subtitleSource').value = source; syncSettingChoices(); }
   syncPlayerSettingsUI();
   const key = subtitleStoreKey(), saved = key ? await window.lilac.savedSubtitles(key).catch(() => []) : [], requestId = playbackRequestId;
-  // Re:Anime / Miruro: the site's Korean track; without one the episode's machine translation, the one already made
-  // (from whichever source) or one made now from the best source as the automatic translation picks it (Jimaku, then
-  // the site's Japanese and English tracks); with 자막 자동 번역 off or not set up, the track that would be translated.
+  // Re:Anime / Miruro: the site's own subtitle, never a machine translation (that is the AI 번역 chip): its Korean track,
+  // else its best other track (Japanese, then the English dialogue), the rest listed under the chip. Pressing it ends a
+  // series watched in machine translation (see prefersAiSubtitle), so its next episodes open with the site's track too.
   if (source === 'reanime') {
+    preferAiSubtitle(false);
     const tracks = currentPlaybackContext.subtitleTracks || [], korean = tracks.find(isKoreanTrack);
     if (korean) { selectSubtitleTrack(korean); return; }
-    const translated = saved.find(item => item.source === 'gemini');
-    if (translated) { applySavedSubtitle(translated); return; }
-    if (await autoTranslate(() => requestId !== playbackRequestId, true) || requestId !== playbackRequestId) return;
     const track = translationSourceTrack() || tracks[0];
     if (track) selectSubtitleTrack(track); else $('#subtitleState').textContent = `${trackSourceLabel()} 자막 트랙이 없습니다.`;
     return;
