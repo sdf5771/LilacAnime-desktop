@@ -20,3 +20,14 @@ test('Korean sites\' episode labels: numbers, half episodes and specials', () =>
     assert.deepEqual(info(label), { name, number: null, special: true }, label);
   assert.equal(info('SPY 1화').special, undefined, 'a word that only starts like SP is not a special');
 });
+
+test('a number in an episode\'s title is not its number (issue #11)', () => {
+  assert.deepEqual(info('80000대장경'), { name: '80000대장경', number: null });
+  assert.deepEqual(info('팔만대장경'), { name: '팔만대장경', number: null });
+  assert.deepEqual(info('3월의 라이온'), { name: '3월의 라이온', number: null });
+  for (const [label, number] of [['5회', 5], ['제7화', 7], ['EP 3', 3], ['#4', 4], ['12-13', 12], ['12 END', 12], ['12 (完)', 12], ['1기 3화', 3], ['80000대장경 5화', 5]])
+    assert.equal(info(label).number, number, label);
+  const numbered = labels => vm.runInContext(`numberTitledEpisodes(${JSON.stringify(labels)}.map(episodeLabelInfo)).map(e=>e.number)`, context);
+  assert.deepEqual([...numbered(['1화', '2화', '3화', '4화', '80000대장경', '6화'])], [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual([...numbered(['팔만대장경', '80000대장경', 'OVA 1화'])], [1, 2, null]);
+});

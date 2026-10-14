@@ -675,11 +675,28 @@ async function ohliAnilist(native,year){
 // "특별편"). A special has no episode number of its own: read as one, "OVA 1화" was 1화 a second time (listed twice,
 // saved over 1화, given 1화's OP/ED times). It keeps its label as its name instead, and special: true.
 const SPECIAL_EPISODE=/^\s*(?:OVA|OAD|ONA|SP|SPECIAL|스페셜|특별편?|번외편?|극장판)(?![a-z])/i;
+// The number a label gives: one marked as an episode's ("12화", "5회", "제3화", "EP 3", "#3") or the label itself
+// ("12", "12-13", "12 END", "12 (完)"). A number inside an episode's own title ("80000대장경") is part of the title,
+// not its number: read as one, the 5th episode was 80000화.
+function episodeLabelNumber(label){
+  const text=String(label||'').trim(),marked=text.match(/(\d+(?:\.\d+)?)\s*[화회話]/)||text.match(/^(?:제|ep(?:isode)?\.?|#)\s*(\d+(?:\.\d+)?)/i);
+  if(marked)return Number(marked[1])||null;
+  const lead=text.match(/^(\d+(?:\.\d+)?)([\s\S]*)$/);if(!lead)return null;
+  const rest=lead[2].replace(/[([{【][^)\]}】]*[)\]}】]/g,'').replace(/\b(?:end|final|fin)\b|完|끝|最終/gi,'');
+  return /\p{L}/u.test(rest)?null:Number(lead[1])||null;
+}
 function episodeLabelInfo(label){
   const text=String(label||'').trim();
   if(SPECIAL_EPISODE.test(text))return {name:text.replace(/\s*화\s*$/,''),number:null,special:true};
-  const number=Number(text.match(/(\d+(?:\.\d+)?)\s*화/)?.[1]||text.match(/\d+(?:\.\d+)?/)?.[0])||null;
+  const number=episodeLabelNumber(text);
   return {name:number?String(number):text||'1',number};
+}
+// An episode listed by its title alone ("팔만대장경") is numbered by its place in the site's order: the one after the
+// numbered episode before it (1 at the start). Specials keep no number.
+function numberTitledEpisodes(episodes){
+  let last=0;
+  for(const episode of episodes){if(episode.special)continue;if(!episode.number)episode.number=Math.floor(last)+1;last=episode.number}
+  return episodes;
 }
 // A series: what it is (원제, 장르, 방영일, 총화수 in its info rows), its story and every episode (100 a page). One saved
 // from www.ohli24.net (its url there) is opened here by its title, or found by a search for it.
@@ -696,8 +713,14 @@ async function ohliDetail(anime){
   // The site's order (sort: 100 a numbered episode) is kept for what it cannot tell apart; the numbered episodes come
   // first by number, the specials (OVA, SP) after them. A special between episodes keeps its own number (9.5화 is
   // 9.5, not 5), so it is listed, played and saved apart from the episode its number ends in.
-  const episodes=list.map(item=>({...episodeLabelInfo(item.title),url:ohliPath('e',item.slug),dub:false,provider:'ohli24',order:Number(item.sort)||0,...(ohliDay(item.published_at)?{airedDate:ohliDay(item.published_at)}:{})}))
-    .sort((a,b)=>Number(Boolean(a.special))-Number(Boolean(b.special))||(a.number||0)-(b.number||0)||a.order-b.order).map(({order,...episode})=>episode);
+  // An episode titled by name alone ("80000대장경") takes its number from its address (/e/<title N화>), or else from
+  // its place in the site's order.
+  const listed=list.map(item=>{
+    const info=episodeLabelInfo(item.title),fromSlug=!info.number&&!info.special&&Number(String(item.slug||'').match(/(\d+(?:\.\d+)?)\s*화\s*$/)?.[1]);
+    return {...info,...(fromSlug?{number:fromSlug}:{}),url:ohliPath('e',item.slug),dub:false,provider:'ohli24',order:Number(item.sort)||0,...(ohliDay(item.published_at)?{airedDate:ohliDay(item.published_at)}:{})};
+  });
+  numberTitledEpisodes(listed.slice().sort((a,b)=>a.order-b.order));
+  const episodes=listed.sort((a,b)=>Number(Boolean(a.special))-Number(Boolean(b.special))||(a.number||0)-(b.number||0)||a.order-b.order).map(({order,...episode})=>episode);
   // A movie is its one episode, whatever the site calls it ("14기", the movie's own title): 1화, as before.
   if(comic.category==='극장판'&&episodes.length===1){const [only]=episodes;delete only.special;Object.assign(only,{name:'1',number:1})}
   const ids=await idsLookup;
@@ -838,6 +861,7 @@ async function linkaniDetail(anime){
       if(!episodes.some(episode=>episode.url===href))episodes.push({...info,url:href,dub,provider:'linkani'});
     });
   });
+  for(const dub of [false,true])numberTitledEpisodes(episodes.filter(episode=>episode.dub===dub));
   episodes.sort((a,b)=>Number(a.dub)-Number(b.dub)||Number(Boolean(a.special))-Number(Boolean(b.special))||(a.number||0)-(b.number||0));
   // The original title (원제, under the episode list) and the air year find the AniList entry, as 애니24's do, so AniSkip
   // has the OP/ED times; a poster taken from AniList (anilist-<id>.png) names it outright.
@@ -2209,12 +2233,13 @@ app.whenReady().then(async () => {
     const root = await linkkfFetch(`${LINKKF_EPISODE_API}/api2.php?epid=${encodeURIComponent(postId)}`);
     return (Array.isArray(root) ? root : []).map(server => ({
       id: server.id, name: server.server_name || `Server ${server.id}`,
-      episodes: (server.server_data || []).map(item => ({
+      episodes: numberTitledEpisodes((server.server_data || []).map(item => ({
         name: String(item.name || item.slug || ''), slug: String(item.slug || ''),
-        // The player's episode number (next episode, subtitles, OP/ED) from the name ("12", "12화", "12-13").
-        number: Number(String(item.name || item.slug || '').match(/\d+/)?.[0]) || null,
+        // The player's episode number (next episode, subtitles, OP/ED) from the name ("12", "12화", "12-13"); an
+        // episode named by its title ("80000대장경") is numbered by its place in the list instead.
+        number: episodeLabelNumber(item.name) || episodeLabelNumber(item.slug),
         token: String(item.link || `${postId}v${server.id}_${item.slug || ''}`), postId
-      }))
+      })))
     })).filter(server => server.episodes.length);
   });
   ipcMain.handle('linkkf:play', async (_, episode) => {

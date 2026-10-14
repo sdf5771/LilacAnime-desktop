@@ -161,13 +161,13 @@ function renderDownloads(){seedDownloadTitles();const list=$('#downloadList'),co
   list.replaceChildren(...[...groups].map(([key,jobs])=>{const card=jobs.length>1?downloadGroupCard(key,jobs.slice().sort((a,b)=>Number(Boolean(a.episodeLabel))-Number(Boolean(b.episodeLabel))||Number(a.episodeNumber)-Number(b.episodeNumber))):downloadCard(jobs[0]);card.dataset.groupKey=key;return card}));
   if(anchorKey){const again=[...list.children].find(node=>node.dataset.groupKey===anchorKey);if(again)main.scrollTop+=again.getBoundingClientRect().top-anchorTop}
   $('#emptyDownloads').classList.toggle('hidden',state.downloads.length>0);refreshEpisodeDownloadButtons()}
-function renderLibrary(){if(typeof catalogUpdateUI!=='undefined')catalogUpdateUI.renderLibrary();else renderCards('#libraryGrid',state.library);$('#emptyLibrary').classList.toggle('hidden',state.library.length>0);renderDownloads();}
+function renderLibrary(){$('#libraryCount').textContent=String(state.library.length);if(typeof catalogUpdateUI!=='undefined')catalogUpdateUI.renderLibrary();else renderCards('#libraryGrid',state.library);$('#emptyLibrary').classList.toggle('hidden',state.library.length>0);renderDownloads();}
 function episodeDownloadJob(anime,episode){return state.downloads.find(job=>job.key===`${anime.mal_id||anime.id}:${episode.provider||'provider'}:${episode.url||episode.token||episode.id||episode.number}`)}
 function episodeRef(episode){return encodeURIComponent(String(episode.url||episode.token||episode.id||episode.number||''))}
 // Linkkf episodes saved before they carried a number (history, downloads) only have their name ("12", "12화").
 function episodeNumberOf(episode){if(episode?.special)return null;return Number(episode?.number)||Number(String(episode?.name??'').match(/\d+/)?.[0])||null}
 // How an episode is named: "12화", or a special's own label ("OVA 1화", "SP 노벨 히로인즈").
-function episodeTitle(episode){const name=String(episode?.name??'');return /\d$/.test(name)?`${name}화`:name}
+function episodeTitle(episode){const name=String(episode?.name||episode?.number||'');return /\d$/.test(name)?`${name}화`:name}
 // A download's episode: its label when it is a special, else its number.
 function jobEpisodeText(job){return job.episodeLabel||`${job.episodeNumber}화`}
 function jobByRef(ref){return state.downloads.find(job=>episodeRef(job.episode||{})===ref)||(legacyEpisodeRefs.has(ref)?state.downloads.find(job=>episodeRef(job.episode||{})===legacyEpisodeRefs.get(ref)):undefined)}
@@ -298,7 +298,7 @@ async function openDetail(id) {
       // Android records a view once the detail page has stayed open for 9 seconds, then refreshes the counters.
       setTimeout(()=>{if(openDetail.token===token&&dialog.open)window.lilac.linkkfRecordView(a.id).then(showStats).catch(()=>{})},9000);
     }
-    const playLinkkf=(ep,episodes)=>{const episodeNumber=Number(String(ep.name).match(/\d+/)?.[0]||1);dialog.close();return resolveIntoPlayer(()=>window.lilac.linkkfResolve(ep),`${titleOf(a)} · ${ep.name}화`,{episode:ep,subtitleTitle:titleOf(a),image:imageOf(a),seriesEpisodes:episodes,resolveKind:'linkkf',anime:normalize(a)},titleOf(a),episodeNumber)};
+    const playLinkkf=(ep,episodes)=>{const episodeNumber=episodeNumberOf(ep)||1;dialog.close();return resolveIntoPlayer(()=>window.lilac.linkkfResolve(ep),`${titleOf(a)} · ${episodeTitle(ep)}`,{episode:ep,subtitleTitle:titleOf(a),image:imageOf(a),seriesEpisodes:episodes,resolveKind:'linkkf',anime:normalize(a)},titleOf(a),episodeNumber)};
     // Linkkf episodes load with the page, like Android, so "재생" can resume the last played one.
     let linkkfServers=null;
     if(isLinkkf){
@@ -307,7 +307,7 @@ async function openDetail(id) {
         if(openDetail.token!==token)return;linkkfServers=servers;block.replaceChildren();
         if(!servers.length){block.innerHTML='<p class="episode-loading">등록된 회차가 없습니다.</p>';return}
         servers.forEach(server=>mountEpisodeList(block,{heading:server.name,episodes:server.episodes,anime:a,resolveKind:'linkkf',onPlay:ep=>playLinkkf(ep,server.episodes)}));
-        const target=linkkfResumeTarget(a,servers);if(target.episode){playButton.disabled=false;playButton.innerHTML=playLabel(`${target.episode.name}화 ${target.resume?'이어보기':'재생'}`)}
+        const target=linkkfResumeTarget(a,servers);if(target.episode){playButton.disabled=false;playButton.innerHTML=playLabel(`${episodeTitle(target.episode)} ${target.resume?'이어보기':'재생'}`)}
       }).catch(e=>{if(openDetail.token===token)block.innerHTML=`<p class="episode-loading">${escapeHtml(e.message)}</p>`});
     }
     $('.detail-play').onclick=async()=>{

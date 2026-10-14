@@ -326,7 +326,7 @@ function selectVideoServer(label) {
   if (!episode || (label && label === context.videoServer)) { renderVideoServers(); return; }
   const duration = playbackDuration(), resumeProgress = duration ? Math.min(94, video.currentTime / duration * 100) : 0, title = context.subtitleTitle || $('#skipTitle').value.trim();
   const { videoServers, videoServer, resolving, currentUrl, ...keep } = context;
-  resolveIntoPlayer(() => window.lilac.providerResolve(episode), `${title} · ${episode.name || episode.number}화`, { ...keep, resumeProgress }, title, Number($('#skipEpisode').value) || episode.number || 1);
+  resolveIntoPlayer(() => window.lilac.providerResolve(episode), `${title} · ${episodeTitle(episode)}`, { ...keep, resumeProgress }, title, Number($('#skipEpisode').value) || episode.number || 1);
 }
 
 function renderQualityChoices() {
@@ -367,8 +367,8 @@ async function playSiblingEpisode(episode) {
   if (!episode) return;
   const episodes = currentPlaybackContext.seriesEpisodes || [], title = currentPlaybackContext.subtitleTitle || $('#playerTitle').textContent.split(' · ')[0];
   const context = { episode, subtitleTitle: title, image: currentPlaybackContext.image || '', seriesEpisodes: episodes, comparisonEpisodes: nearbyEpisodes(episodes, episode), resolveKind: currentPlaybackContext.resolveKind, anime: currentPlaybackContext.anime };
-  $('#downloadStatus').textContent = `${episode.name || episode.number}화를 준비하는 중...`;
-  await resolveIntoPlayer(() => context.resolveKind === 'linkkf' ? window.lilac.linkkfResolve(episode) : window.lilac.providerResolve(episode), `${title} · ${episode.name || episode.number}화`, context, title, episodeNumberOf(episode) || 1);
+  $('#downloadStatus').textContent = `${episodeTitle(episode)}를 준비하는 중...`;
+  await resolveIntoPlayer(() => context.resolveKind === 'linkkf' ? window.lilac.linkkfResolve(episode) : window.lilac.providerResolve(episode), `${title} · ${episodeTitle(episode)}`, context, title, episodeNumberOf(episode) || 1);
 }
 
 // Explicit seeks let the viewer watch the destination segment until they leave it.
@@ -529,7 +529,7 @@ function updateMediaSession() {
   if (!('mediaSession' in navigator)) return;
   const episode = currentPlaybackContext.episode, title = $('#playerTitle').textContent;
   const image = currentPlaybackContext.image || currentPlaybackContext.anime?.images?.webp?.large_image_url || '';
-  navigator.mediaSession.metadata = new MediaMetadata({ title: episode ? `${episode.name || episode.number}화` : title, artist: currentPlaybackContext.subtitleTitle || title.split(' · ')[0], album: 'LilacAnime', artwork: /^https?:/i.test(image) ? [{ src: image, sizes: '512x512' }] : [] });
+  navigator.mediaSession.metadata = new MediaMetadata({ title: episode ? `${episodeTitle(episode)}` : title, artist: currentPlaybackContext.subtitleTitle || title.split(' · ')[0], album: 'LilacAnime', artwork: /^https?:/i.test(image) ? [{ src: image, sizes: '512x512' }] : [] });
   navigator.mediaSession.setActionHandler('previoustrack', siblingEpisode(-1) ? () => playSiblingEpisode(siblingEpisode(-1)) : null);
   navigator.mediaSession.setActionHandler('nexttrack', siblingEpisode(1) ? () => playSiblingEpisode(siblingEpisode(1)) : null);
 }

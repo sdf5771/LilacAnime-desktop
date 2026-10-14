@@ -38,6 +38,14 @@ body.ott-scrolled .sidebar,body:not(.ott-home) .sidebar{background-color:color-m
 .big-search .search-icon{width:20px;height:20px}
 
 main{padding-bottom:0}
+/* <main> scrolls under the fixed header, so its scrollbar starts below the header: at the top of the page a short
+   thumb was hidden behind it. */
+main::-webkit-scrollbar{width:12px}
+main::-webkit-scrollbar-track{margin-top:var(--ott-head);background:transparent}
+main::-webkit-scrollbar-thumb{min-height:40px;border:3px solid transparent;border-radius:999px;background:#ffffff47 padding-box}
+main::-webkit-scrollbar-thumb:hover{background-color:#ffffff73}
+body.light main::-webkit-scrollbar-thumb{background-color:#00000038}
+body.light main::-webkit-scrollbar-thumb:hover{background-color:#00000066}
 .view{max-width:none;padding:calc(var(--ott-head) + 18px) var(--ott-gutter) 64px}
 #homeView{position:relative;padding:0 0 72px}
 
