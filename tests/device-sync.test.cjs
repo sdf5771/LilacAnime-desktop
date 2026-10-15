@@ -169,3 +169,18 @@ test('long episode addresses are sent with ids the server takes, named as the iO
   assert.equal(a.lists.history.filter(item => item.key.startsWith('ohli24:')).length, 1);
   assert.equal(a.lists.history.find(item => item.key.startsWith('ohli24:')).progress, 80);
 });
+
+// The iOS app escapes ( ) ! ' * in an 애니24 address (Ktor's encodeURLParameter) and this app does not
+// (encodeURIComponent): the same episode of "슬라임 (3기)" was two history entries.
+test('an address with ( ) ! \' * escaped is the same entry as one without', () => {
+  const slug = "전생했더니 슬라임이었던 건에 대하여 (3기) 5화!'*", desktop = `ohli24:https://ani.ohli24.com/e/${encodeURIComponent(slug)}`;
+  const ios = desktop.replace(/[!'()*]/g, mark => `%${mark.charCodeAt(0).toString(16).toUpperCase()}`);
+  assert.notEqual(ios, desktop);
+  assert.equal(sync.fitId(ios), sync.fitId(desktop));
+  assert.equal(sync.fitId(desktop), desktop);
+  assert.equal(sync.fitId(ios.replace('%28', '%28'.toLowerCase())), desktop);
+  // An escaped % stays escaped: "%2528" is a literal "%28" in the address, not a "(".
+  assert.equal(sync.fitId('reanime:a%2528b'), 'reanime:a%2528b');
+  const long = `ohli24:https://ani.ohli24.com/e/${encodeURIComponent('가'.repeat(520) + ' (2기) 1화')}`;
+  assert.equal(sync.fitId(long.replace(/[()]/g, mark => `%${mark.charCodeAt(0).toString(16).toUpperCase()}`)), sync.fitId(long));
+});

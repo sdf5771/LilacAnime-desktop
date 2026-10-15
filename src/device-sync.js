@@ -10,8 +10,12 @@
   // whole batch for one it does not: one 애니24 episode address with a long Korean title (each syllable %XX%XX%XX)
   // stopped every sync. Such an id is sent with the address decoded, or else as its source and an FNV-1a of its UTF-8
   // bytes, as the iOS app's DeviceSyncMapping.fitted does, so both name the entry alike.
+  // The iOS app writes an 애니24 address with ( ) ! ' * escaped (Ktor's encodeURLParameter), this app as they are
+  // (encodeURIComponent): "슬라임 (3기)" was two entries. The id has them as they are, on both.
+  const plainMarks = id => id.replace(/%(?:21|27|28|29|2A)/gi, code => String.fromCharCode(parseInt(code.slice(1), 16)));
   const fits = id => Boolean(id) && id.length <= 512 && !id.includes('\n');
-  function fitId(id) {
+  function fitId(raw) {
+    const id = raw && plainMarks(raw);
     if (!id || fits(id)) return id;
     try { const decoded = decodeURIComponent(id); if (fits(decoded)) return decoded; } catch {}
     let h = 0x811c9dc5; for (const byte of new TextEncoder().encode(id)) { h ^= byte; h = Math.imul(h, 0x01000193); }
