@@ -6,8 +6,20 @@
   const COLLECTIONS = ['library', 'history'], HISTORY_LIMIT = 300, BATCH = 500;
   // Entries of what played from this computer only (a file, a local proxy) mean nothing on another device.
   const LOCAL_ONLY = /^(?:file:|blob:|https?:\/\/(?:127\.0\.0\.1|localhost)[:/])/i;
-  const idOf = (collection, item) => collection === 'library' ? (item?.mal_id == null ? '' : String(item.mal_id)) : String(item?.key || item?.src || '');
-  const syncable = (collection, item) => { const id = idOf(collection, item); return Boolean(id) && !(collection === 'history' && LOCAL_ONLY.test(id)); };
+  // The server takes an id of at most 512 characters without a line break (lilacanimeserver checkItem) and refuses the
+  // whole batch for one it does not: one 애니24 episode address with a long Korean title (each syllable %XX%XX%XX)
+  // stopped every sync. Such an id is sent with the address decoded, or else as its source and an FNV-1a of its UTF-8
+  // bytes, as the iOS app's DeviceSyncMapping.fitted does, so both name the entry alike.
+  const fits = id => Boolean(id) && id.length <= 512 && !id.includes('\n');
+  function fitId(id) {
+    if (!id || fits(id)) return id;
+    try { const decoded = decodeURIComponent(id); if (fits(decoded)) return decoded; } catch {}
+    let h = 0x811c9dc5; for (const byte of new TextEncoder().encode(id)) { h ^= byte; h = Math.imul(h, 0x01000193); }
+    return `${id.slice(0, Math.max(0, id.indexOf(':')))}:#${(h >>> 0).toString(36)}`;
+  }
+  const rawIdOf = (collection, item) => collection === 'library' ? (item?.mal_id == null ? '' : String(item.mal_id)) : String(item?.key || item?.src || '');
+  const idOf = (collection, item) => fitId(rawIdOf(collection, item));
+  const syncable = (collection, item) => { const id = rawIdOf(collection, item); return Boolean(id) && !(collection === 'history' && LOCAL_ONLY.test(id)); };
   // FNV-1a of the item's JSON: whether it changed, without keeping a copy of it.
   function hash(item) { const text = JSON.stringify(item ?? null); let h = 0x811c9dc5; for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(36); }
   function byId(collection, list) { const map = new Map(); for (const item of list || []) if (syncable(collection, item)) map.set(idOf(collection, item), item); return map; }
@@ -89,6 +101,6 @@
     return { run, schedule, get running() { return Boolean(running); } };
   }
 
-  const api = { COLLECTIONS, idOf, hash, hashes, plan, merge, createSync };
+  const api = { COLLECTIONS, idOf, fitId, hash, hashes, plan, merge, createSync };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.LilacSync = api;
 })(typeof window !== 'undefined' ? window : globalThis);

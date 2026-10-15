@@ -142,3 +142,30 @@ test('a deployment behind Vercel Authentication says how to reach it', async t =
   const client = new DeviceSync({ app: { getPath: () => dir }, fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({ message: 'Protected by Vercel Authentication', error: { message: 'Protected deployment', code: '401' }, protection: { vercel_auth_enabled: true } }) }) });
   await assert.rejects(client.connect('test-2j058o2n4-team.vercel.app', 'pw'), error => /Deployment Protection/.test(error.message) && /Production/.test(error.message));
 });
+
+// One history entry past the server's 512-character id refused every sync ("items[14]: id는 512자 이하의 문자열이어야
+// 합니다"): an 애니24 address with a long Korean title is sent decoded, or else hashed as the iOS app does.
+test('long episode addresses are sent with ids the server takes, named as the iOS app names them', async () => {
+  const title = '아주긴제목'.repeat(12), url = `https://ani.ohli24.com/e/${encodeURIComponent(`${title} 3화`)}`;
+  assert.ok(`ohli24:${url}`.length > 512);
+  assert.equal(sync.fitId(`ohli24:${url}`), `ohli24:https://ani.ohli24.com/e/${title} 3화`);
+  const longer = sync.fitId(`ohli24:${'가'.repeat(600)}`);
+  assert.match(longer, /^ohli24:#[0-9a-z]+$/);
+  // FNV-1a (32-bit) of the UTF-8 bytes, in base 36: "a" is 0xe40c292c.
+  const fnv = text => { let h = 0x811c9dc5; for (const byte of Buffer.from(text, 'utf8')) { h ^= byte; h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(36); };
+  assert.equal(fnv('a'), (0xe40c292c).toString(36));
+  assert.equal(longer, `ohli24:#${fnv(`ohli24:${'가'.repeat(600)}`)}`);
+  assert.equal(sync.fitId('reanime:x'), 'reanime:x');
+
+  const api = server(), push = api.push;
+  api.push = list => { for (const item of list) if (item.id.length > 512 || item.id.includes('\n')) throw new Error('id는 512자 이하의 문자열이어야 합니다.'); return push(list); };
+  const a = device(api, { history: [watch(`ohli24:${url}`, 40, 2000), watch('reanime:1', 10, 1500)] }), b = device(api);
+  await a.engine.run(); await b.engine.run();
+  assert.deepEqual(b.lists.history.map(item => item.key).sort(), [`ohli24:${url}`, 'reanime:1'].sort());
+  // The phone's copy of the entry (its key the decoded address) is the same entry here, not a second one.
+  b.lists.history[0] = { ...b.lists.history.find(item => item.key.startsWith('ohli24:')), key: sync.fitId(`ohli24:${url}`), progress: 80, updated: 3000 };
+  b.lists.history = b.lists.history.filter((item, at) => at === 0 || !item.key.startsWith('ohli24:'));
+  b.clock = 3000; await b.engine.run(); await a.engine.run();
+  assert.equal(a.lists.history.filter(item => item.key.startsWith('ohli24:')).length, 1);
+  assert.equal(a.lists.history.find(item => item.key.startsWith('ohli24:')).progress, 80);
+});
