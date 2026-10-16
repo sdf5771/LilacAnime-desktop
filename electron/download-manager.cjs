@@ -22,10 +22,24 @@ const HLS_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/53
 class DownloadManager {
   constructor({ app, resolveEpisode, resolveLinkkf, findSubtitle, findJimaku, translateJimaku, jimakuTranslates, findSkips, analyzeOpEd, resolveTitles, saveTrack, translateTrack, broadcast }) {
     // The folder new episodes go to: Videos\LilacAnime, or the one picked in 내 목록 > 다운로드 (an external drive).
-    this.defaultRoot = path.join(app.getPath('videos'), 'LilacAnime');
+    let videos;
+    try { videos = app.getPath('videos'); } catch { /* Windows Known Folder may be unavailable. */ }
+    if (!videos) try { videos = app.getPath('downloads'); } catch { /* fall back to the app's data folder */ }
+    this.defaultRoot = path.join(videos || app.getPath('userData'), 'LilacAnime');
     this.settingsFile = path.join(app.getPath('userData'), 'download-settings.json');
     let saved = ''; try { saved = String(JSON.parse(fs.readFileSync(this.settingsFile, 'utf8')).root || ''); } catch { /* the default */ }
-    this.root = saved && fs.existsSync(saved) ? saved : this.defaultRoot;
+    const roots = [...new Set([saved, this.defaultRoot, path.join(app.getPath('userData'), 'Downloads')].filter(Boolean))];
+    for (const root of roots) {
+      try {
+        // An unplugged custom drive stays selected in settings for when it returns.
+        if (root === saved && !fs.existsSync(root)) continue;
+        fs.mkdirSync(root, { recursive: true });
+        if (!fs.statSync(root).isDirectory()) continue;
+        fs.accessSync(root, fs.constants.W_OK);
+        this.root = root; break;
+      } catch { /* try an available download folder without blocking the app */ }
+    }
+    if (!this.root) throw new Error('다운로드 폴더에 접근할 수 없습니다. 폴더와 저장 권한을 확인해 주세요.');
     this.stateFile = path.join(app.getPath('userData'), 'downloads.json');
     this.resolveEpisode = resolveEpisode;
     this.resolveLinkkf = resolveLinkkf;
@@ -41,7 +55,6 @@ class DownloadManager {
     this.resolving = Promise.resolve();
     this.active = new Map(); // job id -> {job, process, controller, finished}; up to two downloads.
     this.jobs = this.read().map(job => ['downloading', 'resolving'].includes(job.status) ? {...job, status:'queued'} : job.stage ? {...job, stage:''} : job);
-    fs.mkdirSync(this.root, { recursive: true });
     this.relink();
     this.save();
     setImmediate(() => { this.pump(); this.backfillSubtitles(); });

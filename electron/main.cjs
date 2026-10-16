@@ -32,6 +32,7 @@ app.commandLine.appendSwitch('disable-background-media-suspend');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.setAppUserModelId('com.lilac.anime.desktop');
 let mainWindow = null;
+let startupComplete = false;
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
   app.quit();
@@ -39,7 +40,7 @@ if (!singleInstanceLock) {
   app.on('second-instance', () => {
     const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
     if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); }
-    else if (app.isReady()) createWindow();
+    else if (startupComplete) createWindow();
   });
 }
 
@@ -2103,7 +2104,9 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  if (!singleInstanceLock) return;
   desktopState=new DesktopState({app,screen,Tray,Menu,nativeImage,icon:path.join(__dirname,'..','build',process.platform==='win32'?'icon.ico':'icon.png'),show:()=>{
+    if(!startupComplete)return;
     if(!mainWindow||mainWindow.isDestroyed())createWindow();
     if(mainWindow.isMinimized())mainWindow.restore();mainWindow.show();mainWindow.focus();
   }});
@@ -2675,6 +2678,7 @@ app.whenReady().then(async () => {
     }catch(error){console.error(`LILAC_SMOKE_FAILED ${error.stack||error.message}`);process.exitCode=1}
     app.quit();return;
   }
+  startupComplete = true;
   createWindow();
   // Installed builds check GitHub releases shortly after launch; dev runs use the settings button.
   // At start and every 3 hours while the app stays open.
@@ -2682,6 +2686,17 @@ app.whenReady().then(async () => {
   setInterval(()=>buildCatalogIndexes().catch(()=>{}),6*60*60*1000).unref?.();
   if(app.isPackaged){setTimeout(()=>updater.check(),5000);setInterval(()=>updater.check(),3*60*60*1000).unref?.()}
   app.on('activate', () => desktopState.show());
+}).catch(error => {
+  startupComplete = false;
+  console.error('LilacAnime startup failed:', error);
+  let log = '';
+  try {
+    log = path.join(app.getPath('userData'), 'startup-error.log');
+    fs.mkdirSync(path.dirname(log), { recursive: true });
+    fs.appendFileSync(log, `${new Date().toISOString()}\n${error.stack || error}\n\n`, 'utf8');
+  } catch { /* the error dialog is still available when userData cannot be written */ }
+  dialog.showErrorBox('LilacAnime 시작 오류', `앱 초기화에 실패했습니다.\n${error.message || error}${log ? `\n\n오류 기록: ${log}` : ''}`);
+  app.quit();
 });
 
 app.on('before-quit', () => { desktopState?.beforeQuit();downloadManager?.shutdown();closeFlixProxy(); subtitleTranslator?.local?.stop(); updater?.installOnQuit(); });
