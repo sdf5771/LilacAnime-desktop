@@ -6,7 +6,7 @@
   "author": "LilacAnime Desktop",
   "license": "MIT",
   "scripts": {
-    "vendor": "node scripts/build-jassub.cjs",
+    "vendor": "node scripts/build-jassub.cjs && node scripts/build-anime4k.cjs",
     "prestart": "npm run vendor",
     "start": "electron .",
     "predev": "npm run vendor",
@@ -65,6 +65,7 @@
   },
   "dependencies": {
     "adm-zip": "^0.6.1",
+    "anime4k.js": "1.1.3",
     "cheerio": "^1.1.2",
     "ffmpeg-static": "^5.3.0",
     "hls.js": "^1.7.3"

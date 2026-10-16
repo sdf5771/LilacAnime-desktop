@@ -282,6 +282,37 @@ test('the Re:Anime chip puts on the site track without a Korean one instead of a
   assert.equal(context.currentPlaybackContext.sheetSource, 'reanime');
 });
 
+test('auto skip preserves the remaining delay across repeated pauses', () => {
+  let now = 0;
+  const video = { currentTime: 10, paused: false }, pill = { classList: classList() };
+  const context = vm.createContext({
+    autoSkipState: {}, activeSkip: { startTime: 10, endTime: 90 }, activeSkipKey: 'op',
+    $: selector => selector === '#video' ? video : pill,
+    playerFlag: () => true, Date: { now: () => now }
+  });
+  vm.runInContext(section('// Explicit seeks', 'function setPlayerLocked'), context);
+  context.resetAutoSkipState(); context.updateSkipState(video);
+  now = 1000; video.paused = true; context.pauseAutoSkipClock();
+  now = 11000; context.updateSkipState(video);
+  assert.equal(video.currentTime, 10, 'a long pause does not skip');
+  context.pauseAutoSkipClock(); // Repeated notifications must not restart the pause.
+  video.paused = false; context.resumeAutoSkipClock(); context.updateSkipState(video);
+  assert.equal(video.currentTime, 10, 'resuming does not skip immediately');
+  now = 11500; video.paused = true; context.pauseAutoSkipClock();
+  now = 21500; video.paused = false; context.resumeAutoSkipClock();
+  now = 22499; context.updateSkipState(video);
+  assert.equal(video.currentTime, 10, 'the remaining second must elapse');
+  now = 22500; context.updateSkipState(video);
+  assert.equal(video.currentTime, 90, 'skips after 2.5 seconds excluding both pauses');
+
+  video.currentTime = 10; video.paused = true; context.resetAutoSkipState(); context.updateSkipState(video);
+  now = 32500; context.updateSkipState(video);
+  assert.equal(video.currentTime, 10, 'entering a segment while paused does not skip');
+  video.paused = false; context.resumeAutoSkipClock();
+  now = 34999; context.updateSkipState(video); assert.equal(video.currentTime, 10);
+  now = 35000; context.updateSkipState(video); assert.equal(video.currentTime, 90);
+});
+
 test('manual seeks suppress only the destination skip segment and reset for a new video', () => {
   let now = 0;
   const video = { currentTime: 0 }, pill = { classList: classList() };

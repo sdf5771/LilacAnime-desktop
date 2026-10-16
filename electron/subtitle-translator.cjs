@@ -23,7 +23,12 @@ const CLOUDS = {
 };
 const LOCAL_ENGINE = { name: '로컬 AI', eul: '를', ro: '로' };
 const QWEN_API = { international: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', china: 'https://dashscope.aliyuncs.com/compatible-mode/v1' };
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const sleep = (ms, signal) => new Promise((resolve, reject) => {
+  const abort = () => { clearTimeout(timer); reject(signal.reason || Object.assign(new Error('번역을 취소했습니다.'), { name: 'AbortError' })); };
+  if (signal?.aborted) { reject(signal.reason); return; }
+  const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, ms);
+  signal?.addEventListener('abort', abort, { once: true });
+});
 
 function createTranslator(userData) {
   const settingsFile = path.join(userData, 'translation.json'), cacheDir = path.join(userData, 'subtitles', 'translated');
@@ -99,14 +104,15 @@ function createTranslator(userData) {
     }
     return root;
   }
-  async function retried(run) {
+  async function retried(run, signal) {
     for (let attempt = 0; ; attempt++) {
+      signal?.throwIfAborted();
       try { return await run(); }
       catch (error) {
         if (error.name === 'AbortError') throw error;
         const busy = (error.status === 429 && !/quota|billing|insufficient|exceeded your current/i.test(error.message)) || error.status >= 500 || error.name === 'TimeoutError';
         if (!busy || attempt >= 3) throw error;
-        await sleep(Math.min(60000, (error.retryAfter || 2.5 * 2 ** attempt) * 1000));
+        await sleep(Math.min(60000, (error.retryAfter || 2.5 * 2 ** attempt) * 1000), signal);
       }
     }
   }
@@ -156,7 +162,11 @@ function createTranslator(userData) {
       if (next.qwenKey) {
         // A key belongs to one region (Singapore or Beijing): a 401 there means a wrong key or region.
         let models = [];
-        try { models = await qwenModels(next.qwenKey, next.qwenRegion); } catch (error) { if (error.status === 401 || error.status === 403) throw new Error(`Qwen API 키를 확인하지 못했습니다. 키와 지역(${next.qwenRegion === 'china' ? '중국' : '국제'})을 확인해 주세요.`); }
+        try { models = await qwenModels(next.qwenKey, next.qwenRegion); } catch (error) {
+          if (error.status === 401 || error.status === 403) throw new Error(`Qwen API 키를 확인하지 못했습니다. 키와 지역(${next.qwenRegion === 'china' ? '중국' : '국제'})을 확인해 주세요.`);
+          throw error;
+        }
+        if (!models.length) throw new Error('이 키로 쓸 수 있는 Qwen 모델이 없습니다.');
         Object.assign(next, { qwenModels: models, qwenModel: models.includes('qwen-plus') ? 'qwen-plus' : models.find(id => /plus/.test(id)) || models[0] || 'qwen-plus' });
       }
     }
@@ -199,10 +209,10 @@ function createTranslator(userData) {
             if (quotas.some(id => /PerDay/i.test(id))) throw Object.assign(new Error(`Gemini 무료 사용량을 오늘 다 썼습니다 (${model}). 내일 다시 번역하거나 로컬 AI 번역을 쓰세요.`), { status: 429, daily: true });
             const wait = Number(String((error.details || []).find(detail => detail.retryDelay)?.retryDelay || '').replace(/s$/, '')) || Number(error.message.match(/retry in ([\d.]+)\s*s/i)?.[1]) || 2.5 * 2 ** attempt;
             if (wait > 120) throw error;
-            await new Promise(resolve => setTimeout(resolve, (wait + 1) * 1000)); continue;
+            await sleep((wait + 1) * 1000, signal); continue;
           }
           // Busy (503 "high demand"): asked once more, then another Flash model takes over (translateCloud).
-          if (error.status >= 500 || error.name === 'TimeoutError') { if (attempt) throw error; await new Promise(resolve => setTimeout(resolve, 2500)); continue; }
+          if (error.status >= 500 || error.name === 'TimeoutError') { if (attempt) throw error; await sleep(2500, signal); continue; }
           break;
         }
       }
@@ -275,19 +285,19 @@ function createTranslator(userData) {
     return askWithShapes(`openai:${model}`, shapes, async shape => {
       const root = await http('OpenAI', 'https://api.openai.com/v1/responses', { signal, headers: { Authorization: `Bearer ${settings.openaiKey}` }, body: { model, store: false, instructions, input, ...shape } });
       return (root.output || []).flatMap(item => item.content || []).filter(part => part.type === 'output_text').map(part => part.text).join('');
-    });
+    }, signal);
   }
   async function askQwen(settings, model, instructions, input, signal) {
     const shapes = [{ response_format: { type: 'json_object' }, enable_thinking: false }, { response_format: { type: 'json_object' } }, {}];
     return askWithShapes(`qwen:${model}`, shapes, async shape => {
       const root = await http('Qwen', `${QWEN_API[settings.qwenRegion]}/chat/completions`, { signal, headers: { Authorization: `Bearer ${settings.qwenKey}` }, body: { model, messages: [{ role: 'system', content: instructions }, { role: 'user', content: input }], temperature: 0.3, ...shape } });
       return root.choices?.[0]?.message?.content || '';
-    });
+    }, signal);
   }
-  async function askWithShapes(id, shapes, run) {
+  async function askWithShapes(id, shapes, run, signal) {
     let last = null;
     for (let index = workingRequest.get(id) || 0; index < shapes.length; index++) {
-      try { const text = await retried(() => run(shapes[index])); if (text) { workingRequest.set(id, index); return text; } last = new Error('API가 빈 응답을 보냈습니다.'); }
+      try { const text = await retried(() => run(shapes[index]), signal); if (text) { workingRequest.set(id, index); return text; } last = new Error('API가 빈 응답을 보냈습니다.'); }
       catch (error) { last = error; if (error.name === 'AbortError' || error.status !== 400) throw error; }
     }
     throw last;
@@ -295,7 +305,7 @@ function createTranslator(userData) {
   // DeepL translates the texts as they are, one answer for each, in order; the source language is detected (tracks can
   // be English). The anime's title goes along as context, which DeepL reads but does not translate.
   async function askDeepl(settings, texts, context, signal) {
-    const root = await retried(() => http('DeepL', `${deeplApi(settings.deeplKey)}/translate`, { signal, headers: { Authorization: `DeepL-Auth-Key ${settings.deeplKey}` }, body: { text: texts, target_lang: 'KO', preserve_formatting: true, ...(context.title ? { context: `Anime subtitles: ${context.title}` } : {}) } }));
+    const root = await retried(() => http('DeepL', `${deeplApi(settings.deeplKey)}/translate`, { signal, headers: { Authorization: `DeepL-Auth-Key ${settings.deeplKey}` }, body: { text: texts, target_lang: 'KO', preserve_formatting: true, ...(context.title ? { context: `Anime subtitles: ${context.title}` } : {}) } }), signal);
     const list = root.translations || [];
     if (list.length !== texts.length) throw new Error(`DeepL 응답 줄 수가 맞지 않습니다 (${texts.length}줄 중 ${list.length}줄).`);
     return list.map(item => String(item.text || '').trim());

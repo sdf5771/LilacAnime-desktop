@@ -8,7 +8,7 @@ let playerLocked = false, unlockTimer = null, usingKeyboard = false;
 // Focus is only moved into menus for keyboard/remote users; mouse users would just see a stray focus ring.
 window.addEventListener('keydown', () => { usingKeyboard = true; }, true);
 window.addEventListener('pointerdown', () => { usingKeyboard = false; }, true);
-const autoSkipState = { enteredKey: null, enteredAt: 0, skippedKey: null, manualSeekTime: null };
+const autoSkipState = { enteredKey: null, enteredAt: 0, pausedAt: null, skippedKey: null, manualSeekTime: null };
 
 const PLAYER_ASPECTS = { original: 0, '16:9': 16 / 9, '21:9': 21 / 9, '4:3': 4 / 3, fill: 0 };
 function playerAspect() {
@@ -25,6 +25,7 @@ function applyPlayerAspect() {
   $('#video').style.objectFit = aspect === 'original' ? 'contain' : 'fill';
   $$('#psAspects button').forEach(button => { const selected = button.dataset.aspect === aspect; button.classList.toggle('selected', selected); button.setAttribute('aria-pressed', String(selected)); });
   window.LilacAss?.resize();
+  window.LilacAnime4K?.layout();
 }
 new ResizeObserver(applyPlayerAspect).observe($('#immersivePlayer'));
 $('#video').addEventListener('loadedmetadata', applyPlayerAspect);
@@ -56,6 +57,7 @@ function openPlayerSettings(open, focusSection = null) {
 
 // Mirrors the settings page so both edit the same stored values.
 function syncPlayerSettingsUI() {
+  window.LilacAnime4K?.syncUI();
   $('#psAutoPlay').checked = playerFlag('playerAutoPlay');
   $('#psSkipButton').checked = playerFlag('playerSkipButton');
   $('#psAutoSkip').checked = playerFlag('playerAutoSkip', false);
@@ -378,19 +380,29 @@ function seekPlayer(time) {
   $('#video').currentTime = time;
 }
 function resetAutoSkipState() {
-  Object.assign(autoSkipState, { enteredKey: null, enteredAt: 0, skippedKey: null, manualSeekTime: null });
+  Object.assign(autoSkipState, { enteredKey: null, enteredAt: 0, pausedAt: null, skippedKey: null, manualSeekTime: null });
 }
 
-// Android auto skip: the skip pill stays visible for 2.5 s before an OP/ED is skipped automatically.
+function pauseAutoSkipClock() {
+  if (autoSkipState.enteredKey !== null && autoSkipState.pausedAt == null) autoSkipState.pausedAt = Date.now();
+}
+function resumeAutoSkipClock() {
+  if (autoSkipState.pausedAt != null) {
+    autoSkipState.enteredAt += Date.now() - autoSkipState.pausedAt;
+    autoSkipState.pausedAt = null;
+  }
+}
+
+// The skip pill stays visible for 2.5 s, excluding time spent paused.
 function updateSkipState(video) {
   const showButton = playerFlag('playerSkipButton');
   $('#skipNow').classList.toggle('hidden', !activeSkip || !showButton);
-  if (!activeSkip) { autoSkipState.enteredKey = null; autoSkipState.skippedKey = null; autoSkipState.manualSeekTime = null; return; }
-  if (autoSkipState.enteredKey !== activeSkipKey) { autoSkipState.enteredKey = activeSkipKey; autoSkipState.enteredAt = Date.now(); autoSkipState.skippedKey = null; }
+  if (!activeSkip) { autoSkipState.enteredKey = null; autoSkipState.pausedAt = null; autoSkipState.skippedKey = null; autoSkipState.manualSeekTime = null; return; }
+  if (autoSkipState.enteredKey !== activeSkipKey) { autoSkipState.enteredKey = activeSkipKey; autoSkipState.enteredAt = Date.now(); autoSkipState.pausedAt = video.paused ? Date.now() : null; autoSkipState.skippedKey = null; }
   const manualTime = autoSkipState.manualSeekTime;
   const manuallyEntered = manualTime !== null && manualTime >= activeSkip.startTime && manualTime < activeSkip.endTime;
   if (!manuallyEntered) autoSkipState.manualSeekTime = null;
-  if (!manuallyEntered && playerFlag('playerAutoSkip', false) && autoSkipState.skippedKey !== activeSkipKey && Date.now() - autoSkipState.enteredAt >= 2500 && activeSkip.endTime > video.currentTime) {
+  if (!video.paused && !manuallyEntered && playerFlag('playerAutoSkip', false) && autoSkipState.skippedKey !== activeSkipKey && Date.now() - autoSkipState.enteredAt >= 2500 && activeSkip.endTime > video.currentTime) {
     autoSkipState.skippedKey = activeSkipKey; video.currentTime = activeSkip.endTime;
   }
 }
@@ -495,7 +507,7 @@ function drawPipFrame() {
   const width = Math.min(sourceWidth, 1280), height = Math.max(1, Math.round(width / ratio));
   if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, width, height);
-  if (video.readyState >= 2) ctx.drawImage(video, 0, 0, width, height);
+  if (video.readyState >= 2) ctx.drawImage(window.LilacAnime4K?.frame() || video, 0, 0, width, height);
   if (!$('#subtitleEnabled')?.checked) return;
   if (currentSubtitle?.assRendering) { const ass = window.LilacAss?.frame(video); if (ass?.width) ctx.drawImage(ass, 0, 0, width, height); }
   else drawPipCues(ctx, width, height, video);
@@ -721,8 +733,9 @@ async function takeScreenshot() {
   const name = `${($('#playerTitle').textContent || 'LilacAnime').trim()} ${time}`;
   let data = '';
   try {
-    const canvas = document.createElement('canvas'); canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height); data = canvas.toDataURL('image/png');
+    const source = window.LilacAnime4K?.frame() || video;
+    const canvas = document.createElement('canvas'); canvas.width = source.width || video.videoWidth; canvas.height = source.height || video.videoHeight;
+    canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height); data = canvas.toDataURL('image/png');
   } catch { /* a tainted canvas: taken from the window below */ }
   let rect = null; const player = $('#immersivePlayer'), shown = [];
   if (!data) {
@@ -772,6 +785,8 @@ new MutationObserver(records => { for (const record of records) for (const node 
 makeRemoteFocusable();
 
 // --- wiring ------------------------------------------------------------------------------------
+$('#video').addEventListener('pause', pauseAutoSkipClock);
+$('#video').addEventListener('play', resumeAutoSkipClock);
 $('#playerSettingsButton').onclick = () => openPlayerSettings(!playerSettingsOpen());
 $('#closePlayerSettings').onclick = () => { openPlayerSettings(false); $('#playerSettingsButton').focus(); };
 $('#psAutoPlay').onchange = event => localStorage.setItem('playerAutoPlay', String(event.target.checked));
@@ -806,5 +821,6 @@ $('#unlockPlayer').onclick = event => { event.stopPropagation(); setPlayerLocked
 // Settings stay open while the pointer is on them; a click on the video closes them (Android dropdown).
 $('#playerSettings').addEventListener('pointerdown', event => event.stopPropagation());
 $('#video').addEventListener('ratechange', () => { if (playerSettingsOpen()) syncPlayerSettingsUI(); });
+window.LilacAnime4K?.init({ getAspect: playerAspect, notify: toast });
 syncPlayerSettingsUI();
 applyPlayerAspect();

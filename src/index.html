@@ -80,6 +80,7 @@
             <label id="catalogSeasonField">분기<select id="catalogSeason"><option value="">전체 분기</option><option value="WINTER">1분기 · 겨울</option><option value="SPRING">2분기 · 봄</option><option value="SUMMER">3분기 · 여름</option><option value="FALL">4분기 · 가을</option></select></label>
             <div class="catalog-filter-actions"><button type="submit" class="primary">필터 적용</button><button id="catalogFilterReset" type="button" class="ghost">초기화</button></div>
           </div>
+          <div id="catalogExtraFilters" class="catalog-filter-fields hidden"></div>
           <p id="catalogFilterNote" class="catalog-filter-note" role="status">분류를 불러오는 중…</p>
         </form>
         <div id="allGrid" class="poster-grid"></div>
@@ -103,7 +104,7 @@
 
       <section id="playerView" class="view">
         <div id="immersivePlayer" class="immersive-player controls-visible">
-          <div id="videoStage" class="video-stage"><video id="video" playsinline preload="auto"></video></div>
+          <div id="videoStage" class="video-stage"><video id="video" crossorigin="anonymous" playsinline preload="auto"></video></div>
           <div id="playerSpeedBoost" class="player-speed-boost hidden" role="status">2배속</div>
           <div id="playerEmpty" class="player-loading"><span class="player-spinner"></span><p>영상을 준비하고 있어요</p></div>
           <div class="player-shade player-shade-top"></div><div class="player-shade player-shade-bottom"></div>
@@ -149,6 +150,7 @@
                 <div class="ps-row ps-speed"><span><b>재생 속도</b><small id="psSpeedLabel">1.00x</small></span><div id="psSpeeds" class="ps-chips"><button type="button" data-speed="0.75">0.75x</button><button type="button" data-speed="1">1.00x</button><button type="button" data-speed="1.25">1.25x</button><button type="button" data-speed="1.5">1.50x</button><button type="button" data-speed="2">2.00x</button><button type="button" data-speed="3">3.00x</button><button type="button" data-speed="4">4.00x</button></div></div>
                 <small id="psSeekNote" class="ps-note">뒤로/앞으로 버튼 이동: 10초</small>
                 <section class="ps-section"><p class="ps-group">화면 비율</p><div id="psAspects" class="ps-chips"><button type="button" data-aspect="original">원본</button><button type="button" data-aspect="16:9">16:9</button><button type="button" data-aspect="21:9">21:9</button><button type="button" data-aspect="4:3">4:3</button><button type="button" data-aspect="fill">화면 채우기</button></div><small class="ps-note">선택한 비율로 영상을 늘립니다. 화면 채우기는 창이나 모니터에 맞춰 여백 없이 늘립니다.</small></section>
+                <section class="ps-section"><p class="ps-group">Anime4K</p><div id="psAnime4kModes" class="ps-chips"><button type="button" data-anime4k="off">끄기</button><button type="button" data-anime4k="light">가볍게</button><button type="button" data-anime4k="a">A · 선명하게</button><button type="button" data-anime4k="b">B · 부드럽게</button><button type="button" data-anime4k="c">C · 노이즈 제거</button></div><small class="ps-note">영상을 2배로 확대해 보정합니다. 끊기면 가볍게 또는 끄기를 선택하세요.</small><small id="psAnime4kStatus" class="ps-note" role="status" aria-live="polite"></small></section>
                 <p class="ps-group">자동 재생 · 건너뛰기</p>
                 <label class="ps-switch"><span><b>다음 화 자동재생</b><small>영상이 끝나면 다음 화를 재생합니다</small></span><input id="psAutoPlay" type="checkbox"></label>
                 <label class="ps-switch"><span><b>오프닝·엔딩 건너뛰기 버튼</b><small>오프닝(OP)·엔딩(ED) 노래가 나오면 건너뛰기 버튼을 띄웁니다</small></span><input id="psSkipButton" type="checkbox"></label>
@@ -256,6 +258,7 @@
   <script src="app.js"></script>
   <script src="catalog-browser.js"></script>
   <script src="catalog-updates.js"></script>
+  <script src="anime4k.js"></script>
   <script src="player.js"></script>
   <script src="ott.js"></script>
   <script type="module" src="ass-renderer.js"></script>

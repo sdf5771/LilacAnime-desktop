@@ -144,7 +144,7 @@ function linkkfAnime(item = {}) {
 const LINKKF_SCHEDULE_TAGS = [21189, 21190, 21191, 21192, 21193, 21194, 21195]; // 월~일
 const LINKKF_SEASON_TYPES = { pv: 5086, movie: 5061, adult16: 5085 };
 async function linkkfFilterTags() {
-  const load = taxonomy => linkkfFetch(`${LINKKF_API}/link/api.php?taxonomy=${encodeURIComponent(taxonomy)}&limit=200&orderby=name&order=ASC`).then(root => (root.terms || []).map(term => ({ id: Number(term.tag_ID) || 0, name: String(term.name || '').trim(), count: Number(term.count) || 0 })).filter(tag => tag.id > 0 && tag.name)).catch(() => []);
+  const load = taxonomy => linkkfFetch(`${LINKKF_API}/link/api.php?taxonomy=${encodeURIComponent(taxonomy)}&limit=200&orderby=name&order=ASC`).then(root => (root.terms || []).map(term => ({ id: Number(term.tag_ID) || 0, name: String(term.name || '').trim(), count: Number(term.count) || 0 })).filter(tag => tag.id > 0 && tag.name));
   const [formats, genres, years] = await Promise.all([load('anime-seasontype'), load('anigenres'), load('anime-seasonys')]);
   return { formats, genres, years: years.reverse() };
 }
@@ -627,7 +627,7 @@ const ohliDay=value=>{const time=Date.parse(value||'');return Number.isFinite(ti
 function ohliAnime(item){
   const slug=String(item.slug||item.title||''),info=ohliInfo(item),count=Number(item.episodes_count)||Number(String(item.eps||'').match(/\d+/)?.[0])||null;
   return {provider:'ohli24',id:slug,mal_id:`ohli24:${slug}`,title:String(item.title||slug),title_english:'',title_japanese:String(item.original_title||info['원제']||''),
-    images:{webp:{large_image_url:item.thumbnail?`${OHLI24_WEB}/storage/${item.thumbnail}`:''}},score:Number(item.rating)||null,year:String(info['방영일']||item.published_at||'').match(/\d{4}/)?.[0]||'',
+    images:{webp:{large_image_url:item.thumbnail?`${OHLI24_WEB}/storage/${item.thumbnail}`:''}},score:Number(item.rating)||null,year:String(info['방영일']||info['상영일']||item.published_at||'').match(/\d{4}/)?.[0]||'',
     type:item.category==='극장판'?'Movie':'TV',episodes:Number(item.episode_total)||count,availableEpisodes:count,totalEpisodes:Number(item.episode_total)||null,status:String(item.category||(item.eps?'방영중':'')),
     synopsis:ohliText(item.description),genres:String(item.tags_string||'').split(',').map(name=>name.trim()).filter(Boolean).map(name=>({name})),studios:[],url:ohliPath('c',slug)};
 }
@@ -2177,7 +2177,8 @@ app.whenReady().then(async () => {
   const playerMediaRequest=details=>Boolean(playerStreamHeaders)&&['xhr','media'].includes(details.resourceType)&&/^https?:/i.test(details.url)&&!details.url.startsWith(MIRURO_WEB)&&details.webContentsId!==undefined&&details.webContentsId===mainWindow?.webContents?.id;
   session.defaultSession.webRequest.onBeforeSendHeaders({urls:['*://*/*']},(details,callback)=>{let headers=details.requestHeaders||{};const host=new URL(details.url).host,remembered=resolvedStreamHeaders.get(host)||(playerMediaRequest(details)?playerStreamHeaders:null);if(remembered){for(const [key,value] of Object.entries(remembered)){if(['referer','origin','user-agent','cookie','authorization'].includes(key.toLowerCase())&&value)headers[key]=value;}}callback({requestHeaders:headers});});
   session.defaultSession.webRequest.onHeadersReceived({urls:['*://*/*']},(details,callback)=>{
-    if(!playerMediaRequest(details))return callback({});
+    const directVideo=details.resourceType==='media'&&details.webContentsId===mainWindow?.webContents?.id&&/^https?:/i.test(details.url)&&!details.url.startsWith(MIRURO_WEB);
+    if(!playerMediaRequest(details)&&!directVideo)return callback({});
     const headers={...details.responseHeaders};for(const key of Object.keys(headers))if(/^access-control-allow-(?:origin|credentials)$/i.test(key))delete headers[key];
     headers['Access-Control-Allow-Origin']=['*'];callback({responseHeaders:headers});
   });
@@ -2320,7 +2321,7 @@ app.whenReady().then(async () => {
     reanimeBase: REANIME_WEB, reanimeFetch: url => providerFetch(url, { json: true, referer: `${REANIME_WEB}/search` }), reanimeItems, reanimeReleaseItems: () => sortedFromIndex('reanime', 'year'),
     animenosubBase: ANIMENOSUB_WEB, animenosubFetch: url => providerFetch(url, { referer: `${ANIMENOSUB_WEB}/` }), animenosubItems: animenosubList,
     linkkfTags: linkkfFilterTags, linkkfFilter, miruroApi, miruroItem, updates: catalogUpdates,
-    linkaniBase: LINKANI_WEB, linkaniFetch, linkaniItems, ohliAiring, ohliBrowse
+    linkaniBase: LINKANI_WEB, linkaniFetch, linkaniItems, ohliAiring, ohliBrowse, ohliBase: OHLI24_WEB, ohliPage, ohliAnime
   });
   ipcMain.handle('catalog:facets', (_, provider) => catalogBrowser.facets(String(provider || '')));
   ipcMain.handle('catalog:browse', (_, provider, request) => catalogBrowser.browse(String(provider || ''), request || {}));
