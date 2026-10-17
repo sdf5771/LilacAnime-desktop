@@ -92,6 +92,7 @@ contextBridge.exposeInMainWorld('lilac', {
   installLocalModel: id => ipcRenderer.invoke('localai:install', id),
   cancelLocalModelInstall: id => ipcRenderer.invoke('localai:cancel-install', id),
   addLocalModelFile: () => ipcRenderer.invoke('localai:add-file'),
+  setLocalModelOptions: (id, options) => ipcRenderer.invoke('localai:model-options', id, options),
   removeLocalModel: id => ipcRenderer.invoke('localai:remove', id),
   onLocalModelProgress: callback => ipcRenderer.on('localai:progress', (_, value) => callback(value)),
   cancelTranslation: id => ipcRenderer.invoke('subtitle:cancel', id),

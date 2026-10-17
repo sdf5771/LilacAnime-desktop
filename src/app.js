@@ -1107,6 +1107,16 @@ function renderLocalAi(value){
     if(progress!=null){action.textContent=`받는 중 ${progress}% · 취소`;action.onclick=()=>window.lilac.cancelLocalModelInstall(model.id)}
     else if(model.installed){action.textContent=model.path?'목록에서 빼기':'삭제';action.onclick=async()=>{if(!confirm(`${model.label} 모델을 ${model.path?'목록에서 뺄까요':'삭제할까요'}?`))return;renderTranslationSettings(await window.lilac.removeLocalModel(model.id))}}
     else{action.textContent=model.partial?`이어 받기 · ${Math.round(model.partial/model.size*100)}% 받음`:`받기 · ${(model.size/1e9).toFixed(1)}GB`;action.onclick=()=>{if(!model.lowMemory||confirm(lowMemoryQuestion(model,'받을까요')))installLocalModel(model.id)}}
+    if(model.path){
+      row.classList.add('local-model-custom');
+      const options=document.createElement('details');options.className='local-model-options';
+      options.innerHTML='<summary>번역 입력 설정</summary><div class="local-model-fields"><label>입력 형식<select class="local-input-mode"><option value="auto">자동 · 모델 템플릿</option><option value="chat">일반 지시문</option><option value="translation">원문 + 언어 지정</option></select></label><label>원문 언어<select class="local-source-language"><option value="auto">자동</option><option value="ja">일본어</option><option value="en">영어</option><option value="zh">중국어</option><option value="ko">한국어</option></select></label><label class="local-prompt-field">사용자 프롬프트<textarea rows="4" maxlength="8000" placeholder="Translate the following text into Korean. Output only the translation.\n\n{text}"></textarea><small>비워 두면 기본 프롬프트 사용 · {text}: 원문 · {source_lang}: 원문 언어 · {target_lang}: ko</small></label><button type="button" class="local-options-save">저장</button></div>';
+      const mode=options.querySelector('.local-input-mode'),language=options.querySelector('.local-source-language'),prompt=options.querySelector('textarea'),save=options.querySelector('.local-options-save');
+      mode.value=model.inputMode||'auto';language.value=model.sourceLanguage||'auto';prompt.value=model.customPrompt||'';
+      const update=()=>{options.querySelector('.local-prompt-field').hidden=mode.value==='translation'};mode.onchange=update;update();
+      save.onclick=async()=>{save.disabled=true;try{renderTranslationSettings(await window.lilac.setLocalModelOptions(model.id,{inputMode:mode.value,sourceLanguage:language.value,customPrompt:prompt.value}));toast('번역 입력 설정을 저장했어요.')}catch(error){toast(`저장하지 못했습니다: ${ipcMessage(error)}`);save.disabled=false}};
+      row.append(options);
+    }
     return row;
   }));
 }

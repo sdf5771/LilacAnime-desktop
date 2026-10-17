@@ -86,6 +86,21 @@ const PARALLEL = 4, IDLE_STOP = 30 * 1000;
 //   (Gemma 4's template turns it on with enable_thinking; Android's adapter keeps it off too).
 // - Anything else (Qwen3 Instruct and other chat models): the instruction with the list in English, Qwen's sampling.
 const INSTRUCTION = 'Translate the following segment into Korean, without additional explanation.';
+// Language-aware templates consume the source itself, not a translation instruction.
+// Detect the template's inputs rather than a model/file name; kwargs survive llama.cpp's
+// OpenAI message normalization (extra fields inside content parts do not).
+function translationInput(model, template = '') {
+  const mode = model.inputMode || 'auto';
+  return mode === 'translation' || mode === 'auto' && !model.customPrompt && /\bsource_lang_code\b/.test(template) && /\btarget_lang_code\b/.test(template);
+}
+function sourceLanguage(source, configured = 'auto') {
+  if (configured !== 'auto') return configured;
+  return /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/u.test(source) ? 'ja' : /\p{Script=Hangul}/u.test(source) ? 'ko' : 'en';
+}
+function translationRequest(source, model) {
+  return { messages: [{ role: 'user', content: source }], temperature: 0,
+    chat_template_kwargs: { type: 'text', source_lang_code: sourceLanguage(source, model.sourceLanguage), target_lang_code: 'ko' } };
+}
 const HY_MT2_INSTRUCTION = 'Translate the following text into Korean. Note that you should only output the translated result without any additional explanation:';
 // cast: the work's main characters ("堀京子 = 호리 쿄코 (female)"), for Gemma, which can tell from them who says 형 or 오빠.
 function request(source, terms, kind, before = [], cast = []) {
@@ -139,15 +154,26 @@ function createLocalAi(userData) {
   const memory = Math.round(os.totalmem() / 2 ** 30);
   const models = () => {
     const ran = runs();
-    return [...MODELS, ...added().map(item => ({ id: `file:${item.path}`, label: path.basename(item.path), note: '직접 추가한 파일', path: item.path, size: item.size }))]
+    return [...MODELS, ...added().map(item => ({ id: `file:${item.path}`, label: path.basename(item.path), note: '직접 추가한 파일', path: item.path, size: item.size, inputMode: item.inputMode || 'auto', sourceLanguage: item.sourceLanguage || 'auto', customPrompt: item.customPrompt || '' }))]
       .map(model => ({ ...model, installed: fs.existsSync(modelPath(model)), downloading: downloads.has(model.id) ? { done: downloads.get(model.id).done, total: downloads.get(model.id).total } : null, partial: !model.path && !downloads.has(model.id) ? partialSize(model) : 0, run: ran[modelPath(model)] || null, ...(model.ram ? { memory, lowMemory: memory < model.ram } : {}) }))
       .filter(model => !model.legacy || model.installed);
   };
   const partialSize = model => { try { return fs.statSync(`${modelPath(model)}.part`).size; } catch { return 0; } };
   function addFile(file) {
     if (!/\.gguf$/i.test(file) || !fs.existsSync(file)) throw new Error('GGUF 파일을 골라 주세요.');
-    const list = added().filter(item => item.path !== file); list.push({ path: file, size: fs.statSync(file).size });
+    const saved = added(), previous = saved.find(item => item.path === file);
+    const list = saved.filter(item => item.path !== file); list.push({ ...previous, path: file, size: fs.statSync(file).size });
     fs.mkdirSync(root, { recursive: true }); fs.writeFileSync(addedFile, JSON.stringify(list)); return `file:${file}`;
+  }
+  function setModelOptions(id, options = {}) {
+    const list = added(), item = list.find(item => `file:${item.path}` === id);
+    if (!item) throw new Error('직접 추가한 모델을 선택해 주세요.');
+    if (!['auto', 'chat', 'translation'].includes(options.inputMode)) throw new Error('올바른 입력 형식을 선택해 주세요.');
+    if (!['auto', 'ja', 'en', 'zh', 'ko'].includes(options.sourceLanguage)) throw new Error('올바른 원문 언어를 선택해 주세요.');
+    const customPrompt = String(options.customPrompt || '');
+    if (customPrompt.length > 8000 || customPrompt && !customPrompt.includes('{text}')) throw new Error('프롬프트에는 원문이 들어갈 {text}를 넣어 주세요.');
+    Object.assign(item, { inputMode: options.inputMode, sourceLanguage: options.sourceLanguage, customPrompt });
+    fs.writeFileSync(addedFile, JSON.stringify(list));
   }
   const runtimeExe = kind => {
     const walk = dir => { try { return fs.readdirSync(dir, { withFileTypes: true }).flatMap(item => item.isDirectory() ? walk(path.join(dir, item.name)) : [path.join(dir, item.name)]); } catch { return []; } };
@@ -519,6 +545,7 @@ function createLocalAi(userData) {
     const model = models().find(item => item.id === modelId) || models().find(item => item.installed);
     if (!model) throw new Error('로컬 AI 모델이 없습니다. 설정 > 자막 자동 번역에서 모델을 받아 주세요.');
     const { port, template } = await start(model, status);
+    const languageInput = translationInput(model, template);
     const names = characterTerms(context.characters || []), kind = modelKind(model, template);
     const cast = (context.characters || []).slice(0, 15).map(character => { const full = names.find(term => term.ja === String(character.native || '').trim()); return full ? `${full.ja} = ${full.ko}${/^(?:male|female)$/i.test(character.gender) ? ` (${character.gender.toLowerCase()})` : ''}` : ''; }).filter(Boolean);
     // An answer is cut off at a few times the line's length (a subtitle line never needs more), so a model stuck
@@ -538,12 +565,19 @@ function createLocalAi(userData) {
       while (!fatal && !signal?.aborted) {
         const index = pick ? pick() : next < texts.length ? next++ : undefined;
         if (index === undefined) break;
-        const source = texts[index], body = request(source, [...termsFor(source, names), ...speakerTerms(source, context.characters)], kind, texts.slice(Math.max(0, index - 2), index), cast);
+        const source = texts[index], body = languageInput ? translationRequest(source, model)
+          : model.customPrompt ? { messages: [{ role: 'user', content: model.customPrompt.replace(/\{(text|source_lang|target_lang)\}/g, (_, key) => ({ text: source, source_lang: sourceLanguage(source, model.sourceLanguage), target_lang: 'ko' })[key]) }], temperature: 0.3 }
+          : request(source, [...termsFor(source, names), ...speakerTerms(source, context.characters)], model.inputMode === 'chat' ? 'chat' : kind, texts.slice(Math.max(0, index - 2), index), cast);
         try {
           // A Japanese word left in the answer (えっ, 先輩) is asked again, twice at most. ja-ko-vn's temperature of 0.1
           // would give the same answer again, so its second and third tries are less certain.
           let text = '';
-          for (let attempt = 0; attempt < 3; attempt++) { text = clean(await ask(attempt && kind === 'jako' ? { ...body, temperature: 0.5 } : body, source), source); if (text && !KANA.test(text)) break; }
+          for (let attempt = 0; attempt < 3; attempt++) {
+            text = clean(await ask(attempt && kind === 'jako' ? { ...body, temperature: 0.5 } : body, source), source);
+            // A language template returning English must not replace the Japanese subtitle.
+            if (languageInput && /\p{L}/u.test(text) && !/\p{Script=Hangul}/u.test(text)) text = '';
+            if (text && !KANA.test(text)) break;
+          }
           if (text) { result.set(index, text); onLine(index, text); }
         } catch (error) { if (!server) fatal = error; }
         touch(); progress(++done, texts.length);
@@ -553,11 +587,11 @@ function createLocalAi(userData) {
     return { translations: result, model };
   }
 
-  return { models, installModel, cancelInstall, removeModel, addFile, translateLines, stop, modelPath };
+  return { models, installModel, cancelInstall, removeModel, addFile, setModelOptions, translateLines, stop, modelPath };
 }
 
 // The prompt a model is asked with, as part of the translation cache key (a changed prompt is not hidden behind
 // translations made with the old one).
-const promptVersion = model => !model ? '' : modelKind(model) === 'hy-mt2' ? '+context-1' : modelKind(model) === 'gemma' ? '+gemma-3' : '';
+const promptVersion = model => !model ? '' : '+input-1:' + JSON.stringify([model.path || '', model.inputMode || 'auto', model.sourceLanguage || 'auto', model.customPrompt || '']) + (modelKind(model) === 'hy-mt2' ? '+context-1' : modelKind(model) === 'gemma' ? '+gemma-3' : '');
 
 module.exports = { createLocalAi, LOCAL_AI_MODELS: MODELS, promptVersion };

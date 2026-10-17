@@ -2596,6 +2596,7 @@ app.whenReady().then(async () => {
     const id=translator().local.addFile(result.filePaths[0]);return translator().saveSettings({localModel:id});
   });
   ipcMain.handle('localai:cancel-install',(_,id)=>{translator().local.cancelInstall(String(id||''));return true});
+  ipcMain.handle('localai:model-options', (_, id, options) => { translator().local.setModelOptions(String(id || ''), options); return translator().settings(); });
   ipcMain.handle('localai:remove',(_,id)=>{translator().local.removeModel(String(id||''));return translator().settings()});
   ipcMain.handle('gemini:set',(_,value={})=>translator().saveSettings(value||{}));
   // The player's run leaves (its episode changed, or its button was pressed again); downloads keep theirs.
