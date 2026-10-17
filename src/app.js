@@ -867,22 +867,9 @@ new ResizeObserver(()=>renderCueStyle()).observe($('#video'));$('#video').addEve
 function syncSettingChoices(){[['titleLanguageChoices','titleLanguage'],['themeChoices','themeSelect'],['sourceChoices','contentSource'],['qualityChoices','defaultQuality'],['playerStartChoices','playerStart'],['subtitleChoices','subtitleSource']].forEach(([group,select])=>$$(`#${group} button`).forEach(button=>button.classList.toggle('selected',button.dataset.value===$(`#${select}`).value)))}
 function applyTheme(value){const systemLight=matchMedia('(prefers-color-scheme: light)').matches,wantsLight=value==='light'||(value==='system'&&systemLight);document.body.classList.toggle('light',wantsLight);window.lilac?.setWindowTheme?.(wantsLight)}
 
-// Android HomeScreen (Linkkf): 방영 일정(UP/월~일) + PV·트레일러 / 극장판 / 16+ rails.
-const SCHEDULE_TABS=['UP','월','화','수','목','금','토','일'];
-let linkkfSchedule=null;
-function renderScheduleTab(index){
-  $$('#scheduleTabs button').forEach((button,i)=>{button.classList.toggle('selected',i===index);button.setAttribute('aria-selected',String(i===index))});
-  const items=index===0?state.season:(linkkfSchedule?.[index-1]||[]);
-  if(index>0&&!linkkfSchedule){$('#scheduleRail').classList.add('loading-cards');$('#scheduleRail').replaceChildren();return}
-  renderCards('#scheduleRail',items.slice(0,20));
-  if(!items.length)$('#scheduleRail').innerHTML='<p class="rail-empty">이 요일에 등록된 작품이 없습니다.</p>';
-}
+// Linkkf-only home collections; the shared weekly schedule loads independently.
 async function loadLinkkfHome(){
-  $('#scheduleSection').classList.remove('hidden');$('#seasonTitle').textContent='최신 애니메이션';
-  const today=(new Date().getDay()+6)%7+1;let selected=today;
-  $('#scheduleTabs').replaceChildren(...SCHEDULE_TABS.map((label,index)=>{const button=document.createElement('button');button.type='button';button.setAttribute('role','tab');button.textContent=label;button.onclick=()=>{selected=index;renderScheduleTab(index)};return button}));
-  renderScheduleTab(selected);
-  window.lilac.linkkfSchedule().then(days=>{linkkfSchedule=days;renderScheduleTab(selected)}).catch(()=>{linkkfSchedule=[];renderScheduleTab(selected)});
+  $('#seasonTitle').textContent='최신 애니메이션';
   window.lilac.linkkfSections().then(sections=>{[['pv','#pvSection','#pvRail'],['movie','#movieSection','#movieRail'],['adult16','#adultSection','#adultRail']].forEach(([key,section,rail])=>{const items=sections?.[key]||[];$(section).classList.toggle('hidden',!items.length);if(items.length)renderCards(rail,items)})}).catch(()=>{});
 }
 

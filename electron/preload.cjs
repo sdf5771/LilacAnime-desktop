@@ -5,6 +5,8 @@ if (process.platform === 'darwin') window.addEventListener('DOMContentLoaded', (
 
 contextBridge.exposeInMainWorld('lilac', {
   season: () => ipcRenderer.invoke('anime:season'),
+  weeklySchedule: day => ipcRenderer.invoke('anime:weekly-schedule', day),
+  providerSchedule: (provider, day) => ipcRenderer.invoke('provider:schedule', provider, day),
   top: () => ipcRenderer.invoke('anime:top'),
   search: query => ipcRenderer.invoke('anime:search', query),
   detail: id => ipcRenderer.invoke('anime:detail', id),

@@ -10,6 +10,8 @@ const { spawn } = require('child_process');
 const { pathToFileURL } = require('url');
 const { createFlixProxyUrl, createFlixAvProxyUrl, closeFlixProxy } = require('./flix-proxy.cjs');
 const { createCatalogBrowser } = require('./catalog-browser.cjs');
+const { createWeeklySchedule } = require('./weekly-schedule.cjs');
+const { createProviderSchedule } = require('./provider-schedule.cjs');
 const { createCatalogUpdates } = require('./catalog-updates.cjs');
 const { createTmdbClient } = require('./tmdb-client.cjs');
 const { DesktopState } = require('./desktop-state.cjs');
@@ -2186,6 +2188,18 @@ app.whenReady().then(async () => {
     headers['Access-Control-Allow-Origin']=['*'];callback({responseHeaders:headers});
   });
   ipcMain.handle('anime:season', () => api('/seasons/now?limit=20&sfw=true'));
+  const weeklySchedule = createWeeklySchedule(day => anissiaFetch(`/anime/schedule/${day}`));
+  ipcMain.handle('anime:weekly-schedule', (_, day) => weeklySchedule(day));
+  const providerSchedule = createProviderSchedule({
+    fallback: weeklySchedule,
+    reanimeBase: REANIME_WEB, reanimeFetch: url => providerFetch(url, { json: true, referer: `${REANIME_WEB}/schedule` }), reanimeItems,
+    miruroApi, miruroItem,
+    animenosubBase: ANIMENOSUB_WEB, animenosubFetch: providerFetch, animenosubItems: animenosubList,
+    ohliBase: OHLI24_WEB, ohliPage, ohliAnime,
+    linkaniBase: LINKANI_WEB, linkaniFetch, linkaniItems,
+    linkkfBase: LINKKF_API, linkkfTags: LINKKF_SCHEDULE_TAGS, linkkfFetch, linkkfAnime
+  });
+  ipcMain.handle('provider:schedule', (_, provider, day) => providerSchedule(provider, day));
   ipcMain.handle('anime:top', () => api('/top/anime?filter=bypopularity&limit=20&sfw=true'));
   ipcMain.handle('anime:search', (_, query) => api(`/anime?q=${encodeURIComponent(query)}&limit=24&sfw=true&order_by=popularity`));
   ipcMain.handle('anime:detail', (_, id) => api(`/anime/${Number(id)}/full`));
