@@ -327,9 +327,33 @@ function selectVideoServer(label) {
   if (label) localStorage.setItem(key, label); else localStorage.removeItem(key);
   if (!episode || (label && label === context.videoServer)) { renderVideoServers(); return; }
   const duration = playbackDuration(), resumeProgress = duration ? Math.min(94, video.currentTime / duration * 100) : 0, title = context.subtitleTitle || $('#skipTitle').value.trim();
-  const { videoServers, videoServer, resolving, currentUrl, ...keep } = context;
+  const { videoServers, videoServer, resolving, currentUrl, miruroFailedServers, ...keep } = context;
   resolveIntoPlayer(() => window.lilac.providerResolve(episode), `${title} · ${episodeTitle(episode)}`, { ...keep, resumeProgress }, title, Number($('#skipEpisode').value) || episode.number || 1);
 }
+
+// A connected playlist is not proof that its segments will keep arriving. If a Miruro
+// stream stops making progress while playing, try another server at the same position.
+let miruroStall = { context: null, position: 0, since: 0 }, miruroSwitching = false;
+async function recoverMiruroServer() {
+  const context=currentPlaybackContext,video=$('#video');
+  if(miruroSwitching||context.episode?.provider!=='miruro'||context.offline||context.resolving||!context.videoServer)return false;
+  const failed=[...new Set([...(context.miruroFailedServers||[]),context.videoServer])];
+  const dubbed=(context.videoServers||[]).find(server=>server.label===context.videoServer)?.kind==='dub';
+  if(failed.length>2||!(context.videoServers||[]).some(server=>!failed.includes(server.label)&&(server.kind==='dub')===dubbed))return false;
+  const duration=playbackDuration(),resumeProgress=duration?Math.min(94,video.currentTime/duration*100):0,title=context.subtitleTitle||$('#skipTitle').value.trim();
+  const {videoServers,videoServer,resolving,currentUrl,...keep}=context;
+  miruroSwitching=true;$('#downloadStatus').textContent='영상 서버가 느려 다른 서버로 연결하는 중...';
+  try{await resolveIntoPlayer(()=>window.lilac.providerResolve(context.episode),`${title} · ${episodeTitle(context.episode)}`,{...keep,miruroFailedServers:failed,resumeProgress,resumeSeconds:video.currentTime},title,context.episode.number||1);return true}
+  finally{miruroSwitching=false;miruroStall={context:null,position:0,since:0}}
+}
+setInterval(()=>{
+  const context=currentPlaybackContext,video=$('#video'),now=Date.now();
+  if(context!==miruroStall.context||video.paused||video.seeking||video.ended||context.resolving||context.offline||context.episode?.provider!=='miruro'||!$('#playerView').classList.contains('active')){
+    miruroStall={context,position:video.currentTime,since:now};return;
+  }
+  if(Math.abs(video.currentTime-miruroStall.position)>.1){miruroStall.position=video.currentTime;miruroStall.since=now;return}
+  if(video.readyState<3&&now-miruroStall.since>=15000){miruroStall.since=now;recoverMiruroServer().catch(()=>{})}
+},1000);
 
 function renderQualityChoices() {
   const levels = hlsPlayer?.levels || [], box = $('#psQuality'), list = $('#psQualityList');

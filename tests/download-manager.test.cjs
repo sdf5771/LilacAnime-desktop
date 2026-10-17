@@ -180,7 +180,7 @@ test('a special (OVA 1화) is saved by its label, not over 1화', async t => {
   assert.equal(fs.readFileSync(one.filePath, 'utf8'), 'ep1');
 });
 
-test('a translated subtitle track is the episode\'s subtitle beside the video when nothing Korean was found, else it stays with the tracks', async t => {
+test('subtitle tracks are translated only when no Korean subtitle was found', async t => {
   const make = (korean, dir, app) => new DownloadManager({ app, broadcast() {},
     resolveEpisode: async () => ({ url: 'https://example/video.mp4', referer: '', subtitleTracks: [{ url: 'https://example/en.vtt', label: 'English', language: 'en' }] }),
     findSubtitle: async () => korean ? { source: 'kairan', path: path.join(dir, 'kairan.vtt'), label: 'Kairan 자막' } : null,
@@ -190,6 +190,8 @@ test('a translated subtitle track is the episode\'s subtitle beside the video wh
     const { dir, app } = fixture(t);
     fs.writeFileSync(path.join(dir, 'kairan.vtt'), 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n안녕하세요\n');
     const manager = make(korean, dir, app); t.after(() => manager.shutdown());
+    let translations = 0; const translate = manager.translateTrack;
+    manager.translateTrack = async (...args) => { translations++; return translate(...args); };
     manager.mirrorFile = async () => ({ inputs: [] });
     manager.runFfmpeg = async job => fs.writeFileSync(job.partialPath, 'video');
     const job = manager.enqueue({ title: korean ? 'Tempest' : 'Ghost Meets Gal', episode: { id: 'one', number: 1, provider: 'reanime' }, episodeNumber: 1 });
@@ -198,9 +200,10 @@ test('a translated subtitle track is the episode\'s subtitle beside the video wh
     if (!korean) {
       assert.equal(job.subtitlePath, job.filePath.replace(/\.mp4$/, '.ko.vtt')); assert.equal(job.subtitleLabel, 'Gemini 번역 (English)');
       assert.equal(track.translatedPath, job.subtitlePath); assert.match(fs.readFileSync(job.subtitlePath, 'utf8'), /안녕/);
+      assert.equal(translations, 1);
     } else {
       assert.match(fs.readFileSync(job.subtitlePath, 'utf8'), /안녕하세요/, 'the fansub stays the subtitle');
-      assert.equal(path.basename(path.dirname(track.translatedPath)), '001화_자막트랙'); assert.equal(path.basename(track.translatedPath), '01_English.ko.vtt');
+      assert.equal(track.translatedPath, undefined); assert.equal(translations, 0);
       assert.equal(fs.existsSync(job.filePath.replace(/\.mp4$/, '.ko.vtt')), false);
     }
   }

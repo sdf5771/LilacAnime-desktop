@@ -7,22 +7,26 @@ const vm = require('node:vm');
 const { createRequire } = require('node:module');
 const { EventEmitter } = require('node:events');
 
-function boot(t, { brokenVideos = false, invalidRoot = false, brokenStore = false } = {}) {
+function boot(t, { brokenVideos = false, invalidRoot = false, brokenStore = false, savedRoot = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lilac-startup-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const userData = path.join(dir, 'profile'); fs.mkdirSync(userData);
+  if (savedRoot) {
+    fs.mkdirSync(path.join(dir, 'chosen'));
+    fs.writeFileSync(path.join(userData, 'download-settings.json'), JSON.stringify({ root: path.join(dir, 'chosen') }));
+  }
   if (invalidRoot) {
     const root = path.join(dir, 'not-a-folder'); fs.writeFileSync(root, 'file');
     fs.writeFileSync(path.join(userData, 'download-settings.json'), JSON.stringify({ root }));
   }
   if (brokenStore) fs.mkdirSync(path.join(userData, 'downloads.json'));
-  const handlers = new Map(), windows = [], errors = [];
+  const handlers = new Map(), windows = [], errors = [], requestedPaths = [];
   const app = new EventEmitter();
   let initialize, startup;
   Object.assign(app, {
     commandLine: { appendSwitch() {} }, setAppUserModelId() {}, requestSingleInstanceLock: () => true,
     isReady: () => true, isPackaged: false, getVersion: () => 'test', quit() { this.quitted = true; },
-    getPath: name => { if (name === 'videos' && brokenVideos) throw new Error("Failed to get 'videos' path"); return name === 'userData' ? userData : path.join(dir, name); },
+    getPath: name => { requestedPaths.push(name); if (name === 'videos' && brokenVideos) throw new Error("Failed to get 'videos' path"); return name === 'userData' ? userData : path.join(dir, name); },
     whenReady: () => ({ then: fn => { initialize = () => startup = Promise.resolve().then(fn); return { catch: fn => { app.onFailure = fn; } }; } })
   });
   class Window extends EventEmitter {
@@ -47,7 +51,7 @@ function boot(t, { brokenVideos = false, invalidRoot = false, brokenStore = fals
   }, { filename });
   const start = async () => { try { await initialize(); } catch (error) { if (app.onFailure) await app.onFailure(error); else throw error; } };
   t.after(() => { try { app.emit('before-quit'); } catch {} });
-  return { app, start, handlers, windows, errors, userData };
+  return { app, start, handlers, windows, errors, userData, requestedPaths };
 }
 
 test('startup registers catalog and TMDB handlers before opening the main window', async t => {
@@ -61,6 +65,17 @@ test('an unavailable Windows Videos path cannot prevent catalog and settings reg
   const run = boot(t, { brokenVideos: true }); await run.start();
   assert.equal(run.handlers.has('provider:catalog'), true);
   assert.equal(run.handlers.has('tmdb:set'), true);
+  assert.equal(run.windows.length, 1);
+  assert.equal(run.requestedPaths.includes('downloads'), false);
+  assert.equal(run.handlers.get('downloads:root')(), null);
+  assert.throws(() => run.handlers.get('downloads:add')(null, {}), /저장 폴더를 선택/);
+  assert.equal(fs.existsSync(path.join(run.userData, 'LilacAnime')), false);
+  assert.equal(fs.existsSync(path.join(run.userData, 'Downloads')), false);
+});
+
+test('a selected folder works even when Windows cannot resolve Videos', async t => {
+  const run = boot(t, { brokenVideos: true, savedRoot: true }); await run.start();
+  assert.equal(run.handlers.get('downloads:root')(), path.join(path.dirname(run.userData), 'chosen'));
   assert.equal(run.windows.length, 1);
 });
 

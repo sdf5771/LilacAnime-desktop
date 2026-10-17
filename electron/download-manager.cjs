@@ -3,6 +3,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { pathToFileURL, fileURLToPath } = require('url');
 const { downloadFile } = require('./download-transfer.cjs');
+const subtitleSource = require('../src/subtitle-source.js');
 
 function safeName(value = '') {
   return String(value).normalize('NFKC').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/g, '').trim().slice(0, 120) || 'episode';
@@ -24,11 +25,11 @@ class DownloadManager {
     // The folder new episodes go to: Videos\LilacAnime, or the one picked in 내 목록 > 다운로드 (an external drive).
     let videos;
     try { videos = app.getPath('videos'); } catch { /* Windows Known Folder may be unavailable. */ }
-    if (!videos) try { videos = app.getPath('downloads'); } catch { /* fall back to the app's data folder */ }
-    this.defaultRoot = path.join(videos || app.getPath('userData'), 'LilacAnime');
+    this.defaultRoot = videos ? path.join(videos, 'LilacAnime') : null;
+    this.root = null;
     this.settingsFile = path.join(app.getPath('userData'), 'download-settings.json');
     let saved = ''; try { saved = String(JSON.parse(fs.readFileSync(this.settingsFile, 'utf8')).root || ''); } catch { /* the default */ }
-    const roots = [...new Set([saved, this.defaultRoot, path.join(app.getPath('userData'), 'Downloads')].filter(Boolean))];
+    const roots = [...new Set([saved, this.defaultRoot].filter(Boolean))];
     for (const root of roots) {
       try {
         // An unplugged custom drive stays selected in settings for when it returns.
@@ -39,7 +40,6 @@ class DownloadManager {
         this.root = root; break;
       } catch { /* try an available download folder without blocking the app */ }
     }
-    if (!this.root) throw new Error('다운로드 폴더에 접근할 수 없습니다. 폴더와 저장 권한을 확인해 주세요.');
     this.stateFile = path.join(app.getPath('userData'), 'downloads.json');
     this.resolveEpisode = resolveEpisode;
     this.resolveLinkkf = resolveLinkkf;
@@ -71,6 +71,7 @@ class DownloadManager {
   // download folder by their series folder and file name; every file of the episode (subtitles, tracks, fonts, poster)
   // moves with its video. Returns how many were found again.
   relink() {
+    if (!this.root) return 0;
     let found = 0;
     for (const job of this.jobs) {
       if (job.status !== 'completed' || !job.filePath || fs.existsSync(job.filePath)) continue;
@@ -87,10 +88,11 @@ class DownloadManager {
   }
   // A new download folder: kept for the next start, and the episodes moved into it are found again.
   setRoot(dir) {
-    if (!dir || !fs.existsSync(dir)) throw new Error('폴더를 찾을 수 없습니다.');
+    if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error('폴더를 찾을 수 없습니다.');
+    fs.accessSync(dir, fs.constants.W_OK);
     this.root = dir;
     fs.writeFileSync(this.settingsFile, JSON.stringify({ root: dir === this.defaultRoot ? '' : dir }));
-    const found = this.relink(); this.save();
+    const found = this.relink(); this.save(); this.pump();
     return { root: this.root, found, missing: this.list().filter(job => job.missing).length };
   }
   // 목록 비우기: every entry not downloading now leaves the list; its files stay on disk.
@@ -102,6 +104,7 @@ class DownloadManager {
   key(request) { return `${request.anime?.mal_id || request.anime?.id || request.title}:${request.episode?.provider || request.resolveKind}:${request.episode?.url || request.episode?.token || request.episode?.id || request.episodeNumber}`; }
 
   enqueue(request) {
+    if (!this.root) throw new Error('사용 가능한 다운로드 폴더가 없습니다. 다운로드 목록에서 저장 폴더를 선택해 주세요.');
     const key = this.key(request), existing = this.jobs.find(job => job.key === key);
     if (existing && existing.status === 'completed' && fs.existsSync(existing.filePath)) { if (!existing.subtitlePath) { existing.subtitleChecked = false; this.backfillSubtitles(); } return existing; }
     if (existing && ['queued','resolving','downloading'].includes(existing.status)) return existing;
@@ -152,7 +155,7 @@ class DownloadManager {
   }
 
   pump() {
-    if(this.stopping)return;
+    if(this.stopping||!this.root)return;
     while (this.active.size < MAX_CONCURRENT_DOWNLOADS) {
       // A job resumed while its previous run is still winding down (or still resolving) is left to that run.
       const job = this.jobs.find(item => item.status === 'queued' && !this.active.has(item.id)); if (!job) return;
@@ -312,21 +315,18 @@ class DownloadManager {
     try { found = await this.findSubtitle?.(job, stream); } catch { /* fall back to the stream's own subtitle */ }
     if(!this.jobs.includes(job)||this.stopping)return;
     job.subtitleChecked = true;
-    // The Jimaku file (and its translation) comes too: as the subtitle when nothing Korean was found, else next to a
-    // Kairan / Csora / Anissia one (a fansub can be another episode's), saved for the episode so the player offers it.
-    // Not when the site has its own Korean subtitle (a RE:Anime / Miruro Korean track, Linkkf's), which is the
-    // episode's: no Jimaku file and no translation beside it (see attachTracks too).
+    // Korean subtitles are final. Without one, a Japanese site track takes priority over Jimaku.
     job.siteKorean = Boolean(stream?.subtitleUrl) && (job.resolveKind === 'linkkf' || ['reanime', 'miruro', 'linkani', 'ohli24'].includes(job.episode?.provider));
     // Whether the episode's own subtitle is Korean (the site's, a fansub, a translation or the user's file): a track
     // translated later stays beside it then, instead of becoming the episode's subtitle (see attachTracks).
     job.koreanSubtitle = job.siteKorean || Boolean(found && !found.stream && KOREAN_SOURCES.includes(found.source));
     if (!found || found.stream) {
       await this.saveSubtitle(job, stream?.subtitleUrl); this.saveAssSubtitle(job, stream?.subtitleAss?.path);
-      if (!job.siteKorean) await this.attachJimaku(job, stream, !found && !job.subtitlePath);
+      if (!job.koreanSubtitle && !subtitleSource.track(stream?.subtitleTracks, 'ja')) await this.attachJimaku(job, stream, !found && !job.subtitlePath);
       return;
     }
     this.copySubtitle(job, found);
-    if (!job.siteKorean) await this.attachJimaku(job, stream, false);
+    if (!job.koreanSubtitle && !subtitleSource.track(stream?.subtitleTracks, 'ja')) await this.attachJimaku(job, stream, false);
   }
   copySubtitle(job, found) {
     if(!this.jobs.includes(job)||this.stopping)return;
@@ -355,7 +355,7 @@ class DownloadManager {
     this.trackQueue = this.trackQueue.then(() => this.translateJimakuFor(job, file, primary && !burned)).catch(() => {});
   }
   async translateJimakuFor(job, file, primary) {
-    if (!this.jobs.includes(job) || !this.translateJimaku) return;
+    if (!this.jobs.includes(job) || !this.translateJimaku || job.koreanSubtitle) return;
     job.stage = 'translate'; job.translateProgress = 'Jimaku 자막'; this.save();
     try {
       // Not beside a Korean subtitle: the episode's own file is the Japanese one, or none (English burned into the video).
@@ -411,16 +411,15 @@ class DownloadManager {
     }
     if (!saved.length || !this.jobs.includes(job)) return;
     job.subtitleTracks = saved; job.updated = Date.now(); this.save();
-    // One machine translation is enough, made from the best source even beside a Kairan / Csora / Anissia subtitle (it
-    // may be another episode's): none from the tracks when the episode's Jimaku file is translated (설정 > 자막 자동 번역); otherwise the
-    // Japanese track (the original dialogue, translated once) or else the English dialogue one (not signs & songs alone,
-    // a written one before an AI dub transcript). Translating every track took one run per language, hours with the
-    // local AI.
-    // None either beside the site's own Korean track (attachSubtitle): the episode has its Korean subtitle.
-    if (job.siteKorean || (job.jimakuFound && this.jimakuTranslates?.())) return;
-    const text = track => `${track.label} ${track.language}`, code = (track, lang) => new RegExp(`^${lang}(?:[-_]|$)`, 'i').test(track.language || '');
-    const rank = track => /signs|songs|forced/i.test(track.label) ? 3 : /dubtitle|\(ai\)|\bai\b/i.test(track.label) ? 2 : /dialogue|full/i.test(track.label) ? 0 : 1;
-    const track = saved.find(item => /japanese|日本/i.test(text(item)) || code(item, 'ja')) || saved.filter(item => /english/i.test(text(item)) || code(item, 'en')).sort((a, b) => rank(a) - rank(b))[0];
+    // No translation beside Korean subtitles. Otherwise: site Japanese, Jimaku, site English.
+    if (job.koreanSubtitle) return;
+    const japanese = subtitleSource.track(saved, 'ja');
+    if (!japanese && job.jimakuFound && this.jimakuTranslates?.()) return;
+    if (!japanese && !job.jimakuFound && subtitleSource.track(stream.subtitleTracks,'ja')) {
+      await this.attachJimaku(job,stream,!job.subtitlePath);
+      if(job.jimakuFound&&this.jimakuTranslates?.())return;
+    }
+    const track = japanese || subtitleSource.track(saved, 'en');
     if (!track) return;
     const title = job.displayTitles?.ko || job.title;
     try {
