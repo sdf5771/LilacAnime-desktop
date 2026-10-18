@@ -2419,12 +2419,12 @@ app.whenReady().then(async () => {
   ipcMain.handle('subtitle-store:save',(_,key,entry)=>subtitleStore.save(String(key||''),entry));
   ipcMain.handle('subtitle-store:remove',(_,key,id)=>subtitleStore.remove(String(key||''),String(id||'')));
   // 자막 싱크 맞추기: check() looks at a few minutes of the episode's audio to offer it, sync() runs ffsubsync over the
-  // whole episode and gives a retimed copy of the subtitle (its ASS too). ffsubsync is installed once, when asked.
+  // whole episode and gives a retimed copy of the subtitle (its ASS too). ffsubsync is installed the first time it is
+  // needed, without asking (as the OP/ED analysis works), its progress shown on the player.
   subtitleSync=createSubtitleSync({userData:app.getPath('userData'),ffmpegPath:require('ffmpeg-static').replace('app.asar','app.asar.unpacked'),managedRoot:subtitleStore.managedRoot});
   let syncCheck=null;
   ipcMain.handle('subtitle-sync:check',async(_,request={})=>{syncCheck?.abort();const abort=new AbortController();syncCheck=abort;try{return await subtitleSync.check({...request,signal:abort.signal})}catch{return null}finally{if(syncCheck===abort)syncCheck=null}});
   ipcMain.handle('subtitle-sync:run',async(event,request={})=>{
-    if(!subtitleSync.installed()){const answer=await dialog.showMessageBox(BrowserWindow.fromWebContents(event.sender),{type:'question',buttons:['설치하고 맞추기','취소'],defaultId:0,cancelId:1,title:'자막 싱크 맞추기',message:'자막 싱크를 맞추는 ffsubsync를 처음 한 번 설치할까요?',detail:'전용 Python과 ffsubsync를 앱 데이터 폴더에 받습니다 (약 130MB). 시스템에 설치된 Python은 건드리지 않아요.'});if(answer.response!==0)return {canceled:true}}
     const status=(message,progress=null)=>{if(!event.sender.isDestroyed())event.sender.send('subtitle-sync:status',{message,progress})};
     try{return await subtitleSync.sync({...request,status})}catch(error){if(error.canceled)return {canceled:true};throw error}
   });
