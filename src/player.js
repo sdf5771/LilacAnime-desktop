@@ -210,9 +210,11 @@ function applyVttLayout() {
   const track = $('#video').textTracks[0]; if (!track?.cues) return;
   flattenVttCues(track);
   const line = vttBaseline(), offset = Number(localStorage.getItem('subtitleSync') || 0) / 1000;
+  // A subtitle synced while its translation comes in on its cues is shown moved by that fix (see runSubtitleSync).
+  const fix = typeof currentSubtitle !== 'undefined' && currentSubtitle?.timeFix, at = time => fix ? time * fix.scale + fix.offset : time;
   for (const cue of track.cues) {
     if (cue.lilacStart === undefined) { cue.lilacStart = cue.startTime; cue.lilacEnd = cue.endTime; }
-    cue.startTime = Math.max(0, cue.lilacStart + offset); cue.endTime = Math.max(0, cue.lilacEnd + offset);
+    cue.startTime = Math.max(0, at(cue.lilacStart) + offset); cue.endTime = Math.max(0, at(cue.lilacEnd) + offset);
     // Top cues (captions, signs) keep a small margin from the top; the rest sit on the subtitle line.
     cue.snapToLines = false; cue.line = cue.lilacTop ? 5 : line; cue.lineAlign = cue.lilacTop ? 'start' : 'end';
     // Chromium translates percentage-positioned cues horizontally again when size < 100,

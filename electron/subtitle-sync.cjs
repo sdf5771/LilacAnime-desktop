@@ -205,15 +205,21 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
       });
       const result = parseResult(output);
       if (!result) throw new Error('ffsubsync가 결과를 알려 주지 않았습니다.');
-      const vtt = syncedName(subtitlePath);
-      rewrite(subtitlePath, vtt, text => retimeVtt(text, result.offset, result.scale));
-      let ass = null;
-      if (assPath && fs.existsSync(assPath)) { ass = syncedName(assPath); rewrite(assPath, ass, text => retimeAss(text, result.offset, result.scale)); }
-      return { ...result, path: vtt, url: pathToFileURL(vtt).href, assPath: ass, assUrl: ass ? pathToFileURL(ass).href : null };
+      return { ...result, ...retime({ subtitlePath, assPath, ...result }) };
     } finally {
       running = null;
       fs.rmSync(work, { recursive: true, force: true });
     }
+  }
+  // A retimed copy of a subtitle (and its ASS) by an offset and scale found before: a translation finished after its
+  // source was synced gets the same fix without running ffsubsync again.
+  function retime({ subtitlePath, assPath = null, offset = 0, scale = 1 }) {
+    if (!subtitlePath || !fs.existsSync(subtitlePath) || !Number.isFinite(offset) || !(scale > 0)) throw new Error('자막 파일이 없습니다.');
+    const vtt = syncedName(subtitlePath);
+    rewrite(subtitlePath, vtt, text => retimeVtt(text, offset, scale));
+    let ass = null;
+    if (assPath && fs.existsSync(assPath)) { ass = syncedName(assPath); rewrite(assPath, ass, text => retimeAss(text, offset, scale)); }
+    return { path: vtt, url: pathToFileURL(vtt).href, assPath: ass, assUrl: ass ? pathToFileURL(ass).href : null };
   }
 
   // A few minutes of the episode where the subtitle has the most lines (one of the windows every 30 s): how late
@@ -246,7 +252,7 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
 
   function cancel() { running?.abort(); }
   function stop() { cancel(); for (const child of children) child.kill(); }
-  return { installed, install, sync, check, cancel, stop, running: () => Boolean(running) };
+  return { installed, install, sync, retime, check, cancel, stop, running: () => Boolean(running) };
 }
 
 module.exports = { createSubtitleSync, retimeVtt, retimeAss, parseResult, estimateLag, vttCues };

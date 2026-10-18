@@ -42,3 +42,18 @@ test('the quick check finds how late the subtitle is from bursts of sound agains
 test('VTT cues are read with hours or without', () => {
   assert.deepEqual(vttCues('WEBVTT\n\n00:01.500 --> 00:02.000\na\n\n01:00:00.000 --> 01:00:01,250\nb\n'), [[1.5, 2], [3600, 3601.25]]);
 });
+
+test('retime: a translation finished later gets the fix found for its source, as new files beside it', t => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const { createSubtitleSync } = require('../electron/subtitle-sync.cjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lilac-retime-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const managedRoot = path.join(dir, 'subtitles'), translated = path.join(managedRoot, 'translated', 'abc.vtt');
+  fs.mkdirSync(path.dirname(translated), { recursive: true }); fs.writeFileSync(translated, 'WEBVTT\n\n00:00:07.200 --> 00:00:10.640\n안녕\n');
+  const sync = createSubtitleSync({ userData: dir, ffmpegPath: 'ffmpeg', managedRoot });
+  const out = sync.retime({ subtitlePath: translated, offset: -3.2, scale: 1 });
+  assert.equal(path.dirname(out.path), path.dirname(translated));
+  assert.match(path.basename(out.path), /^abc\.sync-[a-z0-9]+\.vtt$/);
+  assert.equal(fs.readFileSync(out.path, 'utf8'), 'WEBVTT\n\n00:00:04.000 --> 00:00:07.440\n안녕\n');
+  assert.equal(fs.readFileSync(translated, 'utf8'), 'WEBVTT\n\n00:00:07.200 --> 00:00:10.640\n안녕\n');
+  assert.throws(() => sync.retime({ subtitlePath: path.join(dir, 'missing.vtt'), offset: 1 }));
+});

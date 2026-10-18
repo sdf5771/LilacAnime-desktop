@@ -555,22 +555,35 @@ async function offerKoreanSubtitle(title,episode,requestId,current){
   const name=communityLabel(found.source,found.result).replace(/ 자막$/,'');
   const box=$('#subtitleOffer');$('#subtitleOfferText').textContent=`한국어 자막(${name})을 찾았어요. 바꿀까요?`;
   box.classList.remove('hidden');clearTimeout(offerKoreanSubtitle.timer);offerKoreanSubtitle.timer=setTimeout(()=>box.classList.add('hidden'),20000);
-  $('#subtitleOfferApply').textContent='바꾸기';$('#subtitleOfferApply').onclick=()=>{box.classList.add('hidden');if(requestId===playbackRequestId){preferAiSubtitle(false);attachOnlineSubtitle(found)}};
+  $('#subtitleOfferApply').textContent='바꾸기';$('#subtitleOfferDismiss').textContent='그대로';$('#subtitleOfferApply').onclick=()=>{box.classList.add('hidden');if(requestId===playbackRequestId){preferAiSubtitle(false);attachOnlineSubtitle(found)}};
   $('#subtitleOfferDismiss').onclick=()=>box.classList.add('hidden');
 }
 // 자막 싱크 맞추기: ffsubsync (in the main process) matches the subtitle on screen to the episode's audio and gives a
 // retimed copy, put on screen and saved as "<name> · 자동 싱크". Once a subtitle is on, a few minutes of the audio are
-// compared with it (설정 싱크가 어긋나면 알려 주기); when it runs early or late the box under the player offers the fix.
-// The 자막 싱크 setting goes back to 0 with it, since the copy is matched as it is.
-let subtitleSyncRun=null;const syncChecked=new Set();
+// compared with it (설정 싱크가 어긋나면 자동으로 맞추기); when it runs early or late it is synced right away. Either way
+// the box under the player says what was done, with 되돌리기 (the check may take music for talk now and then).
+// The 자막 싱크 setting goes back to 0 with it, since the copy is matched as it is (되돌리기 puts it back).
+// A subtitle still being translated (Jimaku with 자동 번역) is checked too. Synced then, its cues are shown moved
+// (timeFix, see applyVttLayout) while the translated lines come in on them, and the fix is kept by its file (syncFixes)
+// so the translation gets it when it is done, without running ffsubsync again.
+let subtitleSyncRun=null;const syncChecked=new Set(),syncFixes=new Map();
 const SYNCED=' · 자동 싱크';
 function syncableSubtitle(){const subtitle=currentSubtitle;return subtitle?.path&&/^(https?|file):/i.test(currentPlaybackContext.currentUrl||'')?subtitle:null}
 function renderSyncButton(){const button=$('#autoSyncSubtitle');if(!button||subtitleSyncRun)return;button.disabled=!syncableSubtitle();button.textContent='음성에 맞춰 싱크 맞추기'}
 window.lilac.onSubtitleSyncStatus?.(({message,progress})=>{if(!subtitleSyncRun)return;const text=`${message}${progress!=null?` ${Math.round(progress*100)}%`:''}`;$('#subtitleState').textContent=text;$('#autoSyncSubtitle').textContent=`${text} · 눌러서 취소`});
-async function runSubtitleSync(){
+// The box under the player after a sync: what was done, and 되돌리기 while the subtitle it changed is still on screen.
+function showSyncDone(text,undo){
+  const box=$('#subtitleOffer');$('#subtitleOfferText').textContent=text;box.classList.remove('hidden');
+  clearTimeout(offerKoreanSubtitle.timer);offerKoreanSubtitle.timer=setTimeout(()=>box.classList.add('hidden'),20000);
+  $('#subtitleOfferApply').textContent='되돌리기';$('#subtitleOfferApply').onclick=()=>{box.classList.add('hidden');if(!undo())toast('이미 다른 자막으로 바뀌어 되돌릴 수 없습니다.')};
+  $('#subtitleOfferDismiss').textContent='확인';$('#subtitleOfferDismiss').onclick=()=>box.classList.add('hidden');
+}
+// auto: started by the check, not by the button.
+async function runSubtitleSync(auto=false){
   if(subtitleSyncRun){window.lilac.cancelSubtitleSync();return}
   const subtitle=syncableSubtitle();if(!subtitle){toast('싱크를 맞출 자막이 없습니다.');return}
   const requestId=playbackRequestId,button=$('#autoSyncSubtitle');subtitleSyncRun={subtitle};button.disabled=false;button.textContent='싱크 맞추는 중 · 눌러서 취소';$('#subtitleOffer').classList.add('hidden');
+  if(auto)$('#subtitleState').textContent='자막 싱크가 어긋나 있어 자동으로 맞추는 중...';
   try{
     const result=await window.lilac.syncSubtitle({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,assPath:subtitle.assPath||null,duration:playbackDuration()});
     if(result?.canceled){toast('자막 싱크 맞추기를 취소했습니다.');return}
@@ -578,25 +591,43 @@ async function runSubtitleSync(){
     syncChecked.add(result.path);
     const offset=result.offset,moved=Math.abs(offset)<0.05&&Math.abs(result.scale-1)<0.0005?'이미 잘 맞아요':`${Math.abs(offset).toFixed(2)}초 ${offset<0?'앞당김':'늦춤'}`;
     const manual=Number(localStorage.getItem('subtitleSync')||0);if(manual)setSubtitleSync(0);
+    const done=`자막 싱크를 ${auto?'자동으로 ':''}맞췄어요 (${moved}${manual?' · 수동 싱크 0으로':''})`;
+    if(translating?.path===subtitle.path){
+      const fix={offset,scale:result.scale};syncFixes.set(subtitle.path,fix);subtitle.timeFix=fix;applyVttLayout();window.LilacAss?.setOffset(Math.round(offset*1000));
+      showSyncDone(`${done} · 번역이 끝나면 번역 자막에도 적용돼요`,()=>{
+        if(syncFixes.get(subtitle.path)!==fix||currentSubtitle!==subtitle)return false;
+        syncFixes.delete(subtitle.path);subtitle.timeFix=null;if(manual)setSubtitleSync(manual);else{applyVttLayout();window.LilacAss?.setOffset(0)}
+        toast('자막 싱크를 원래대로 되돌렸습니다.');return true;
+      });
+      return;
+    }
     if(currentSubtitlePath===subtitle.path)currentSubtitlePath=result.path;
     if(subtitle.source==='jimaku'&&currentPlaybackContext.jimakuSubtitle?.path===subtitle.path)currentPlaybackContext.jimakuSubtitle={...currentPlaybackContext.jimakuSubtitle,path:result.path};
-    attachSubtitle(result.url,`${subtitle.label.replace(SYNCED,'')}${SYNCED}`,{path:result.path,assUrl:result.assUrl,assPath:result.assPath,fonts:subtitle.fonts||[],source:subtitle.source,from:subtitle.from||null,fromName:subtitle.fromName||'',notice:`자막 싱크를 맞췄습니다 (${moved}${manual?' · 수동 싱크 0으로':''})`});
-  }catch(error){if(requestId===playbackRequestId){toast(`자막 싱크 맞추기 실패: ${error.message}`);$('#subtitleState').textContent='자막 싱크를 맞추지 못했습니다.'}}
+    attachSubtitle(result.url,`${subtitle.label.replace(SYNCED,'')}${SYNCED}`,{path:result.path,assUrl:result.assUrl,assPath:result.assPath,fonts:subtitle.fonts||[],source:subtitle.source,from:subtitle.from||null,fromName:subtitle.fromName||'',notice:done});
+    // 되돌리기: the subtitle as it was (remembered again, so it comes first for the episode) and the 자막 싱크 setting.
+    const synced=currentSubtitle;
+    showSyncDone(done,()=>{
+      if(requestId!==playbackRequestId||currentSubtitle!==synced)return false;
+      if(manual)setSubtitleSync(manual);
+      if(currentSubtitlePath===result.path)currentSubtitlePath=subtitle.path;
+      if(currentPlaybackContext.jimakuSubtitle?.path===result.path)currentPlaybackContext.jimakuSubtitle={...currentPlaybackContext.jimakuSubtitle,path:subtitle.path};
+      attachSubtitle(subtitle.src,subtitle.label,{path:subtitle.path,assUrl:subtitle.assUrl,assPath:subtitle.assPath,fonts:subtitle.fonts||[],source:subtitle.source,from:subtitle.from||null,fromName:subtitle.fromName||'',notice:'자막 싱크를 원래대로 되돌렸습니다.'});
+      return true;
+    });
+  }catch(error){if(requestId===playbackRequestId){toast(`자막 싱크 ${auto?'자동 ':''}맞추기 실패: ${error.message}`);$('#subtitleState').textContent='자막 싱크를 맞추지 못했습니다.'}}
   finally{subtitleSyncRun=null;renderSyncButton()}
 }
 function checkSubtitleSync(subtitle){
-  if(localStorage.getItem('subtitleSyncCheck')==='false'||!subtitle?.path||syncChecked.has(subtitle.path)||subtitle.label?.endsWith(SYNCED))return;
+  // A translation is timed as the file it was made from: checked once, with that file.
+  if(localStorage.getItem('subtitleSyncCheck')==='false'||!subtitle?.path||syncChecked.has(subtitle.path)||subtitle.from&&syncChecked.has(subtitle.from)||subtitle.label?.endsWith(SYNCED))return;
   const requestId=playbackRequestId;clearTimeout(checkSubtitleSync.timer);
   // A little after the start, so the stream's first segments come first.
   checkSubtitleSync.timer=setTimeout(async()=>{
-    const duration=playbackDuration(),busy=()=>requestId!==playbackRequestId||currentSubtitle!==subtitle||subtitleSyncRun||(translating&&translating.path===subtitle.path);
+    const duration=playbackDuration(),busy=()=>requestId!==playbackRequestId||currentSubtitle!==subtitle||subtitleSyncRun;
     if(busy()||!duration||!syncableSubtitle())return;syncChecked.add(subtitle.path);
     const found=await window.lilac.checkSubtitleSync({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,duration,offsetMs:Number(localStorage.getItem('subtitleSync')||0)}).catch(()=>null);
     if(!found?.off||busy())return;
-    const box=$('#subtitleOffer');$('#subtitleOfferText').textContent=`자막이 대사보다 약 ${Math.abs(found.lag).toFixed(1)}초 ${found.lag>0?'늦게':'빨리'} 나오는 것 같아요. 싱크를 맞출까요?`;
-    box.classList.remove('hidden');clearTimeout(offerKoreanSubtitle.timer);offerKoreanSubtitle.timer=setTimeout(()=>box.classList.add('hidden'),20000);
-    $('#subtitleOfferApply').textContent='싱크 맞추기';$('#subtitleOfferApply').onclick=()=>{box.classList.add('hidden');if(requestId===playbackRequestId&&currentSubtitle===subtitle)runSubtitleSync()};
-    $('#subtitleOfferDismiss').onclick=()=>box.classList.add('hidden');
+    runSubtitleSync(true);
   },6000);
 }
 $('#autoSyncSubtitle').onclick=runSubtitleSync;
@@ -743,7 +774,10 @@ async function runTranslation({file,name,button,provider,manual=false,fresh=fals
     const source=await file();if(!current())return;
     if(translating?.run===run)translating.path=source.path;
     const result=await window.lilac.translateSubtitle({path:source.path,title,id:run,provider,anime:subtitleSearchAnime(),playing:$('#video').currentTime||0,fresh,only:manual&&provider==='local',anySide:!manual});if(!current())return;
-    currentSubtitlePath=result.path;attachSubtitle(fresh?`${result.url}?again=${Date.now()}`:result.url,translatedLabel(result,name),{path:result.path,source:'gemini',from:source.path,fromName:name});
+    // Its source was synced while it ran: the translation is retimed the same way.
+    const fix=syncFixes.get(source.path),synced=fix?await window.lilac.retimeSubtitle({subtitlePath:result.path,...fix}).catch(()=>null):null;if(!current())return;
+    if(synced)syncChecked.add(synced.path);const done=synced||result;
+    currentSubtitlePath=done.path;attachSubtitle(fresh?`${done.url}?again=${Date.now()}`:done.url,`${translatedLabel(result,name)}${synced?SYNCED:''}`,{path:done.path,source:'gemini',from:source.path,fromName:name,...(synced?{notice:'번역을 마치고 맞춰 둔 자막 싱크를 적용했습니다.'}:{})});
     // A button pressed: its side goes on for the series (one made by itself that another side finished does not move it).
     if(manual)rememberSeriesPick({provider:engineSide(result)});
     // The local AI translated this episode (or the API, with 번역 API로도 다음 화 미리 번역 on): the next one is made ready

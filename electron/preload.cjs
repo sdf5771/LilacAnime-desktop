@@ -100,6 +100,7 @@ contextBridge.exposeInMainWorld('lilac', {
   prepareEpisodeSubtitle: options => ipcRenderer.invoke('subtitle:prepare', options),
   checkSubtitleSync: request => ipcRenderer.invoke('subtitle-sync:check', request),
   syncSubtitle: request => ipcRenderer.invoke('subtitle-sync:run', request),
+  retimeSubtitle: request => ipcRenderer.invoke('subtitle-sync:retime', request),
   cancelSubtitleSync: () => ipcRenderer.invoke('subtitle-sync:cancel'),
   onSubtitleSyncStatus: callback => ipcRenderer.on('subtitle-sync:status', (_, value) => callback(value)),
   onTranslateProgress: callback => ipcRenderer.on('translate:progress', (_, value) => callback(value)),
