@@ -60,14 +60,15 @@ function dialogueVtt(text) {
   return `WEBVTT\n\n${use.map(cue => `${cue.timing}\n${cue.body || 'x'}\n`).join('\n')}`;
 }
 
-// The styles of ASS lines that are not speech: opening and ending songs (a fansub's "OP Romaji", "ED English"),
-// signs, songs, karaoke, titles, notes. Toradora!'s English site track has the opening in romaji, kanji and English,
-// 64 lines in a minute and a half nobody speaks in.
-const NOT_SPEECH_STYLE = /(^|[^a-z])(op|ed)([^a-z]|$)|opening|ending|sign|song|karaoke|lyric|title|insert|logo|eyecatch|preview|note|kfx/i;
-// An ASS file's spoken lines as a VTT for ffsubsync: by the style, and not the lines placed or drawn on the picture
-// (\pos, \move, \an7-9, drawings), which are signs. null when it has fewer than 20.
-function assDialogueVtt(text) {
-  let fields = null, events = false; const cues = [];
+// Style names that say a line is not speech: opening and ending songs (a fansub's "OP Romaji", "ED English"), signs,
+// songs, karaoke, titles, notes. Names differ from one fansub to the next ("neo OE", "iFanzSigns", "SS_ED1",
+// "RESURECTION" for an insert song), so a style is also judged by its lines (see speechStyles).
+const NOT_SPEECH_STYLE = /(^|[^a-z])(op|ed)([^a-z]|$)|opening|ending|sign|song|karaoke|kara([^a-z]|$)|lyric|title|insert|logo|eyecatch|preview|note|kfx/i;
+// Tags of lines placed, drawn or sung on the picture: signs and karaoke, not speech.
+const PLACED = /\\(pos|move|an[789]|p[1-9]|i?clip|org|k[fo]?\d|K\d)/;
+// An ASS file's lines: [{style, start, end, text, words}].
+function assLines(text) {
+  let fields = null, events = false; const rows = [];
   for (const line of String(text).replace(/^﻿/, '').split(/\r?\n/)) {
     if (/^\[events\]/i.test(line)) { events = true; continue; }
     if (/^\[/.test(line)) { events = false; continue; }
@@ -76,12 +77,40 @@ function assDialogueVtt(text) {
     if (!/^dialogue:/i.test(line) || !fields) continue;
     const parts = line.slice(line.indexOf(':') + 1).split(','), row = {};
     fields.forEach((field, i) => { row[field] = i === fields.length - 1 ? parts.slice(i).join(',') : (parts[i] || '').trim(); });
-    if (NOT_SPEECH_STYLE.test(row.style || '') || /\\(pos|move|an[789]|p[1-9])/.test(row.text || '')) continue;
-    const words = String(row.text || '').replace(/\{[^}]*\}/g, '').replace(/\\[Nn]/g, ' ').replace(/\\h/g, ' ').trim();
     const start = seconds(String(row.start || '').replace(/:(\d+)$/, '.$1')), end = seconds(String(row.end || '').replace(/:(\d+)$/, '.$1'));
-    if (words && end > start) cues.push([start, end, words]);
+    const words = String(row.text || '').replace(/\{[^}]*\}/g, '').replace(/\\[Nn]/g, ' ').replace(/\\h/g, ' ').trim();
+    if (end > start) rows.push({ style: String(row.style || ''), start, end, text: String(row.text || ''), words });
   }
-  cues.sort((a, b) => a[0] - b[0]);
+  return rows;
+}
+// The styles that hold the speech: not named as signs or songs, few lines placed or sung on the picture (under 30%),
+// and spread over the episode (a third of it at least: an opening's lyrics sit in a minute and a half). When none
+// is, the style with the most plain lines.
+function speechStyles(rows) {
+  const styles = new Map();
+  for (const row of rows) { const s = styles.get(row.style) || { lines: 0, placed: 0, first: Infinity, last: -Infinity }; s.lines++; if (PLACED.test(row.text)) s.placed++; s.first = Math.min(s.first, row.start); s.last = Math.max(s.last, row.start); styles.set(row.style, s); }
+  const starts = rows.map(row => row.start), span = Math.max(...starts) - Math.min(...starts);
+  const speech = [...styles].filter(([name, s]) => !NOT_SPEECH_STYLE.test(name) && s.lines >= 5 && s.placed / s.lines < 0.3 && s.last - s.first >= span / 3).map(([name]) => name);
+  if (speech.length) return new Set(speech);
+  const plain = [...styles].sort((a, b) => (b[1].lines - b[1].placed) - (a[1].lines - a[1].placed))[0];
+  return new Set(plain ? [plain[0]] : []);
+}
+// An ASS file's spoken lines as [start, end, words]: the speech styles' lines not placed on the picture, each once
+// (typesetting repeats a line in layers).
+function assSpeech(text) {
+  const rows = assLines(text);
+  if (!rows.length) return [];
+  const styles = speechStyles(rows), seen = new Set(), cues = [];
+  for (const row of rows) {
+    const key = `${row.start}|${row.end}|${row.words}`;
+    if (!styles.has(row.style) || PLACED.test(row.text) || !row.words || seen.has(key)) continue;
+    seen.add(key); cues.push([row.start, row.end, row.words]);
+  }
+  return cues.sort((a, b) => a[0] - b[0]);
+}
+// An ASS file's spoken lines as a VTT for ffsubsync; null when it has fewer than 20.
+function assDialogueVtt(text) {
+  const cues = assSpeech(text);
   return cues.length >= 20 ? `WEBVTT\n\n${cues.map(([start, end, words]) => `${vttStamp(start)} --> ${vttStamp(end)}\n${words}\n`).join('\n')}` : null;
 }
 // The spoken lines of a subtitle: from the ASS beside it when there is one (its styles tell), else from the VTT.
@@ -109,6 +138,56 @@ function retimeAss(text, offset, scale = 1, segments = null) {
   const move = mover(offset, scale, segments), time = value => seconds(value.replace(/:(\d+)$/, '.$1'));
   return text.replace(/^((?:Dialogue|Comment):\s*[^,\r\n]*,)(\d+:\d{2}:\d{2}[.:]\d{1,3}),(\d+:\d{2}:\d{2}[.:]\d{1,3})/gim,
     (_, head, start, end) => `${head}${assStamp(move(time(start), time(start)))},${assStamp(move(time(end), time(start)))}`);
+}
+// Speech intervals [start, end], sorted and merged.
+function merged(intervals) {
+  const out = [];
+  for (const [start, end] of [...intervals].filter(([s, e]) => e > s).sort((a, b) => a[0] - b[0])) {
+    const last = out[out.length - 1];
+    if (last && start <= last[1]) last[1] = Math.max(last[1], end); else out.push([start, end]);
+  }
+  return out;
+}
+// How well a subtitle fits the reference speech: the share of its lines' time that falls on speech (a site track's
+// dialogue lines, or the speech found in the audio), with its lines moved as a candidate says (move(time, start)).
+// The same measure for every candidate (no change, one shift, segments, another frame rate), so they can be compared.
+function fitScore(cues, speech, move = time => time) {
+  let total = 0, hit = 0;
+  for (const [start, end] of cues) {
+    const from = move(start, start), to = move(end, start);
+    if (to <= from) continue;
+    total += to - from;
+    let low = 0, high = speech.length;
+    while (low < high) { const mid = (low + high) >> 1; if (speech[mid][1] <= from) low = mid + 1; else high = mid; }
+    for (let i = low; i < speech.length && speech[i][0] < to; i++) hit += Math.max(0, Math.min(to, speech[i][1]) - Math.max(from, speech[i][0]));
+  }
+  return total ? hit / total : 0;
+}
+// Segments a candidate may keep: each with 8 lines and 45 s of the subtitle at least, never moving a line before the
+// end of the segment before it (lines stay in order), and, against the audio, each new segment starting at an opening
+// or ending (chapters: AniSkip times in the video) within 20 s, as the audio alone split Oshi no Ko 1 at -102 s and
+// +129 s. ffsubsync's split puts stray segments between the right ones: in Horimiya 1 two blocks of a minute changed
+// places (+143.89 s, then -139.74 s) between 0 and +2.83 s. So while a segment breaks a rule, one segment is let go
+// (its lines take the shift of the one before it; the first, of the one after), the one whose going leaves the best
+// fit (score(parts)), and neighbours within 0.3 s become one. null when nothing is left to split.
+function keptSegments(segments, cues, chapters = null, score = () => 0) {
+  const edges = chapters ? chapters.flatMap(chapter => [Number(chapter.startTime), Number(chapter.endTime)]).filter(Number.isFinite) : null;
+  const join = parts => { const out = []; for (const segment of parts) { const last = out[out.length - 1]; if (!last || Math.abs(last.shift - segment.shift) > 0.3) out.push(segment); } return out; };
+  const linesOf = (parts, i) => cues.filter(([start]) => start >= (i ? parts[i].from : -Infinity) && (i + 1 >= parts.length || start < parts[i + 1].from));
+  const broken = parts => parts.some((_, i) => {
+    const lines = linesOf(parts, i);
+    if (lines.length < 8 || lines[lines.length - 1][0] - lines[0][0] < 45) return true;
+    if (!i) return false;
+    const before = linesOf(parts, i - 1), endBefore = Math.max(...before.map(([, end]) => end)) + parts[i - 1].shift, startHere = lines[0][0] + parts[i].shift;
+    if (startHere < endBefore - 1) return true;
+    return Boolean(edges && !edges.some(edge => Math.abs(edge - startHere) <= 20 || Math.abs(edge - endBefore) <= 20));
+  });
+  let parts = join(segments.map(segment => ({ ...segment })));
+  for (let guard = 0; parts.length > 1 && broken(parts) && guard < 30; guard++) {
+    const options = parts.map((_, i) => join(i ? parts.filter((__, k) => k !== i) : [{ ...parts[1], from: parts[0].from }, ...parts.slice(2)]));
+    parts = options.map(option => ({ option, fit: score(option) })).sort((a, b) => b.fit - a.fit)[0].option;
+  }
+  return parts.length > 1 && !broken(parts) ? parts : null;
 }
 // The segments ffsubsync's split alignment made: each line of the file it was given against the same line in what it
 // wrote, a new segment where the shift changes by more than 0.2 s.
@@ -152,19 +231,23 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
   function installed() {
     try { return JSON.parse(fs.readFileSync(marker, 'utf8')).ffsubsync === FFSUBSYNC_VERSION && fs.existsSync(exe); } catch { return false; }
   }
-  function run(command, args, { env = process.env, signal = null, onOutput = () => {}, stdout = 'pipe' } = {}) {
+  // quiet: ms without any output after which the program is taken as stuck and stopped (FFmpeg reading a stream
+  // reports its progress every half second; a stream that stops sending would leave it waiting for ever).
+  function run(command, args, { env = process.env, signal = null, onOutput = () => {}, stdout = 'pipe', quiet = 0 } = {}) {
     return new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(Object.assign(new Error('취소했습니다.'), { canceled: true }));
       const child = spawn(command, args, { env, windowsHide: true, stdio: ['ignore', stdout, 'pipe'] }); children.add(child);
-      let output = '';
-      const take = chunk => { const text = chunk.toString('utf8'); output = (output + text).slice(-20000); onOutput(text); };
+      let output = '', heard = Date.now(), stuck = false;
+      const take = chunk => { heard = Date.now(); const text = chunk.toString('utf8'); output = (output + text).slice(-20000); onOutput(text); };
       child.stderr.on('data', take); if (stdout === 'pipe') child.stdout.on('data', take);
+      const watch = quiet ? setInterval(() => { if (Date.now() - heard > quiet) { stuck = true; child.kill(); } }, Math.min(quiet, 5000)) : null;
       const abort = () => child.kill();
       signal?.addEventListener('abort', abort, { once: true });
-      child.once('error', error => { children.delete(child); reject(error); });
+      child.once('error', error => { clearInterval(watch); children.delete(child); reject(error); });
       child.once('close', code => {
-        children.delete(child); signal?.removeEventListener('abort', abort);
+        clearInterval(watch); children.delete(child); signal?.removeEventListener('abort', abort);
         if (signal?.aborted) reject(Object.assign(new Error('취소했습니다.'), { canceled: true }));
+        else if (stuck) reject(new Error('영상 음성을 받다가 멈췄어요 (스트림 연결이 끊긴 것 같아요).'));
         else if (code === 0) resolve(output);
         else reject(new Error(output.trim().split('\n').slice(-4).join(' ').slice(-400) || `${path.basename(command)} ${code}`));
       });
@@ -217,7 +300,7 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
   async function extractAudio(videoUrl, headers, duration, target, status, signal) {
     const { input, args } = ffmpegInput(videoUrl, headers);
     await run(ffmpegPath, ['-hide_banner', '-nostdin', '-y', ...args, '-i', input, '-map', '0:a:0', '-vn', '-ac', '2', '-ar', '16000', '-c:a', 'pcm_s16le', target], {
-      signal, onOutput: text => { const time = text.match(/time=(\d+:\d{2}:\d{2}(?:\.\d+)?)/g)?.pop(); if (time && duration > 0) status('영상 음성 읽는 중', Math.min(1, seconds(time.slice(5)) / duration)); },
+      signal, quiet: 90000, onOutput: text => { const time = text.match(/time=(\d+:\d{2}:\d{2}(?:\.\d+)?)/g)?.pop(); if (time && duration > 0) status('영상 음성 읽는 중', Math.min(1, seconds(time.slice(5)) / duration)); },
     });
   }
 
@@ -232,92 +315,127 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
     return path.join(dir, `${base}.sync-${Date.now().toString(36)}${ext}`);
   }
 
+  // The speech found in an audio file (16 kHz mono WAV) by WebRTC's voice detector, as [start, end] intervals: the
+  // reference the candidates are scored against when there is no site track (ffsubsync's own Python runs it).
+  async function speechIn(wav, signal) {
+    const script = path.join(path.dirname(wav), 'speech.py'), python = path.join(venv, WIN ? 'Scripts/python.exe' : 'bin/python');
+    fs.writeFileSync(script, [
+      'import sys, json, wave, webrtcvad',
+      'w = wave.open(sys.argv[1], "rb"); rate = w.getframerate(); vad = webrtcvad.Vad(2)',
+      'step = int(rate * 0.03); data = w.readframes(w.getnframes()); out = []; start = None',
+      'for i in range(0, len(data) // 2 - step + 1, step):',
+      '    t = i / rate; speech = vad.is_speech(data[i * 2:(i + step) * 2], rate)',
+      '    if speech and start is None: start = t',
+      '    if not speech and start is not None: out.append([round(start, 2), round(t, 2)]); start = None',
+      'if start is not None: out.append([round(start, 2), round(len(data) / 2 / rate, 2)])',
+      'print(json.dumps(out))',
+    ].join('\n'));
+    const output = await run(python, [script, wav], { signal, env: { ...process.env, PYTHONUTF8: '1' } });
+    return merged(JSON.parse(output.trim().split('\n').pop()));
+  }
+
   // subtitlePath: the VTT on screen; assPath: its ASS, retimed the same way; timingPath: the file a translation was made
-  // from (its Japanese lines tell dialogue from captions better; the times are the same).
-  // Toradora! 1 (Netflix ja[cc] from Jimaku, music under most of the talk) came out +28.4 s with a 1.042 frame-rate
-  // scale, where the subtitle was 1.3 s late. So ffsubsync never changes the frame rate (web releases do not need it)
-  // and hears the centre of the stereo mix, where dialogue sits with the music spread around it: there it found -1.32 s
-  // with any set of lines, where the whole mix swung between -1.34 and +44 s as ten lines came and went. It is asked
-  // twice, with the dialogue lines only (captions, lyrics and signs left out) and with every line; the result counts
-  // only when both say the same, as a wrong match does not hold when the lines change. Under 0.3 s the subtitle is left
-  // as it is.
-  // referencePath: a dialogue track of the site's own (Re:Anime / Miruro), timed to this video: matched against its
-  // lines instead of the audio (ffsubsync's own advice, "the most accurate"), the audio not read at all. On Toradora!
-  // 1 its English track was 0.14 s off the audio with a score four times the Jimaku file's, and gave -0.97 s in a
-  // second. Either way ffsubsync leaves out a result it does not trust itself (--skip-sync-on-low-quality: a wrong
-  // way round match, or one over 30 s), and that one is not used either.
-  // Against a site track the shift may change along the episode: Toradora! 1 there has its opening (89 s) after the
-  // cold open, where the Netflix-made Jimaku file has none, so every line from the opening on came 89 s early and no
-  // one shift could fix it (-1.24 s and +28 s were both wrong). So the track is matched in segments (ffsubsync's
-  // --split-penalty, up to 150 s): there it found -1.01 s before the opening and +89.25 s after it, as the lines say.
-  // The two runs then agree when nine of ten dialogue lines get the same shift from both. The track's own opening,
-  // ending and sign lines are left out by their ASS style. The audio is matched with one shift, as before.
-  async function sync({ videoUrl, headers = {}, subtitlePath, assPath = null, timingPath = null, referencePath = null, referenceAssPath = null, duration = 0, status = () => {} }) {
+  // from (its Japanese lines tell dialogue from captions better; the times are the same). references: the site's own
+  // tracks ([{path, assPath}], Re:Anime / Miruro, timed to this video), of which the one with the most spoken lines is
+  // the reference; without one, the audio (videoUrl). chapters: the episode's opening and ending (AniSkip), where the
+  // audio may split.
+  //
+  // Candidates are found by ffsubsync and then scored the same way (fitScore: the share of the subtitle's dialogue
+  // that falls on the reference's speech), and the best one is used only when it is clearly better than leaving the
+  // subtitle as it is. What was learned on real episodes:
+  // - The frame rate is not changed blindly: on Toradora! 1 ffsubsync's 1.042 correction moved the lines 28 s the
+  //   wrong way. A changed frame rate is one candidate among the others, against a site track only.
+  // - A subtitle's own captions, lyrics and signs, and a site track's opening, ending and sign lines (see speechStyles),
+  //   are left out: nobody speaks in them.
+  // - The shift may change along the episode (Toradora! 1: an 89 s opening in the video the Netflix-made subtitle has
+  //   not; Horimiya 1: 2.8 s more after its middle), so segments are a candidate too (--split-penalty), kept only as
+  //   keptSegments allows.
+  // - How far to look is not one number: an intro may be longer than any limit, but one search over the whole episode
+  //   gave The Apothecary Diaries 1 -1251 s (every line off the picture). So one shift is looked for within 60 s, 5
+  //   minutes and the whole episode, and the scores choose.
+  // - Against the audio, the centre of the stereo mix (where dialogue sits) is heard: the whole mix swung Toradora! 1
+  //   between -1.3 and +44 s.
+  // Thresholds from 8 episodes against their site tracks: a right shift raised the score by 0.06 to 0.17 (to 0.89 and
+  // over), a subtitle already right by under 0.003.
+  const FIT = { track: { margin: 0.03, floor: 0.6 }, audio: { margin: 0.03, floor: 0.3 } };
+  async function sync({ videoUrl, headers = {}, subtitlePath, assPath = null, timingPath = null, references = [], referencePath = null, referenceAssPath = null, chapters = [], duration = 0, status = () => {} }) {
     if (running) throw new Error('이미 자막 싱크를 맞추는 중입니다.');
-    const byTrack = Boolean(referencePath && fs.existsSync(referencePath));
-    if (!byTrack && !/^(https?|file):/i.test(videoUrl || '')) throw new Error('이 영상은 자동 싱크를 쓸 수 없습니다.');
     if (!subtitlePath || !fs.existsSync(subtitlePath)) throw new Error('자막 파일이 없습니다.');
+    const tracks = [...(references || []), ...(referencePath ? [{ path: referencePath, assPath: referenceAssPath }] : [])].filter(track => track?.path && fs.existsSync(track.path));
+    // The track with the most spoken lines (by content: a "S&S" track has none).
+    const best = tracks.map(track => ({ track, vtt: spokenVtt(track.path, track.assPath) })).map(item => ({ ...item, lines: vttCues(item.vtt).length })).sort((a, b) => b.lines - a.lines)[0];
+    const byTrack = Boolean(best && best.lines >= 20);
+    if (!byTrack && !/^(https?|file):/i.test(videoUrl || '')) throw new Error('이 영상은 자동 싱크를 쓸 수 없습니다.');
     const abort = new AbortController(), work = fs.mkdtempSync(path.join(os.tmpdir(), 'lilac-sync-'));
     running = abort;
+    const stopped = () => { if (abort.signal.aborted) throw Object.assign(new Error('취소했습니다.'), { canceled: true }); };
     try {
       if (!installed()) { status('ffsubsync 설치 준비 중 (처음 한 번)', 0); await install((message, progress) => status(`${message} (처음 한 번)`, progress)); }
-      if (abort.signal.aborted) throw Object.assign(new Error('취소했습니다.'), { canceled: true });
+      stopped();
       const timing = path.join(work, 'dialogue.vtt'), wav = path.join(work, 'audio.wav'), center = path.join(work, 'center.wav'), reference = path.join(work, 'reference.vtt');
       const fromTiming = timingPath && fs.existsSync(timingPath);
       fs.writeFileSync(timing, spokenVtt(fromTiming ? timingPath : subtitlePath, fromTiming ? null : assPath));
-      let against = reference;
+      const cues = vttCues(fs.readFileSync(timing, 'utf8'));
+      let against = reference, speech;
       if (byTrack) {
-        fs.writeFileSync(reference, spokenVtt(referencePath, referenceAssPath));
+        fs.writeFileSync(reference, best.vtt);
+        speech = merged(vttCues(best.vtt));
         status('사이트 자막 트랙에 맞추는 중', null);
       } else {
         status('영상 음성 읽는 중', 0);
         await extractAudio(videoUrl, headers, Number(duration) || 0, wav, status, abort.signal);
         status('ffsubsync로 대사 위치 맞추는 중', null);
         against = center;
-        try { await run(ffmpegPath, ['-hide_banner', '-nostdin', '-y', '-i', wav, '-af', 'dialoguenhance=original=0:enhance=3,pan=mono|c0=FC', '-ar', '16000', '-c:a', 'pcm_s16le', center], { signal: abort.signal }); } catch (error) { if (abort.signal.aborted) throw error; against = wav; }
+        try { await run(ffmpegPath, ['-hide_banner', '-nostdin', '-y', '-i', wav, '-af', 'dialoguenhance=original=0:enhance=3,pan=mono|c0=FC', '-ar', '16000', '-c:a', 'pcm_s16le', center], { signal: abort.signal }); } catch (error) { stopped(); against = wav; }
+        if (against === wav) { await run(ffmpegPath, ['-hide_banner', '-nostdin', '-y', '-i', wav, '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', center], { signal: abort.signal }); against = center; }
+        speech = await speechIn(center, abort.signal);
       }
-      const unsure = message => Object.assign(new Error(message), { uncertain: true });
-      // One run: the shift, and its segments when split (read from the file ffsubsync wrote), up to 150 s either way:
-      // with ffsubsync's 60 s the audio could not reach Toradora!'s +89.3 s (score 59425) and gave -1.32 s (17227).
+      stopped();
+      const length = Math.ceil(Math.max(Number(duration) || 0, ...speech.map(([, end]) => end), ...cues.map(([, end]) => end))) + 30;
+      // One ffsubsync run: a candidate, or null when it found none (or one at the edge of where it looked).
       let runs = 0;
-      const ask = async (lines, split) => {
+      const ask = async ({ lines = timing, reach, split = false, frameRate = false }) => {
         const out = path.join(work, `out-${++runs}.vtt`);
-        const output = await run(exe, [against, '-i', lines, '-o', out, '--ffmpeg-path', path.dirname(ffmpegPath), '--no-fix-framerate', '--skip-sync-on-low-quality',
-          '--max-offset-seconds', '150', '--quality-max-offset-seconds', '150', ...(split ? ['--split-penalty'] : [])], {
-          signal: abort.signal, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', COLUMNS: '400', NO_COLOR: '1', TERM: 'dumb' },
-        });
-        if (/leaving subtitles unmodified/i.test(output.replace(/\s+/g, ' '))) throw unsure('ffsubsync가 결과를 믿기 어렵다고 판단해 싱크를 그대로 뒀어요.');
+        let output;
+        try {
+          output = await run(exe, [against, '-i', lines, '-o', out, '--ffmpeg-path', path.dirname(ffmpegPath), '--skip-sync-on-low-quality', '--max-offset-seconds', String(reach), '--quality-max-offset-seconds', String(reach + 1),
+            ...(frameRate ? [] : ['--no-fix-framerate']), ...(split ? ['--split-penalty'] : [])], { signal: abort.signal, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', COLUMNS: '400', NO_COLOR: '1', TERM: 'dumb' } });
+        } catch (error) { stopped(); return null; }
+        if (/leaving subtitles unmodified/i.test(output.replace(/\s+/g, ' '))) return null;
         const found = parseResult(output);
-        if (!found) throw new Error('ffsubsync가 결과를 알려 주지 않았습니다.');
-        const segments = split && fs.existsSync(out) ? segmentsOf(fs.readFileSync(lines, 'utf8'), fs.readFileSync(out, 'utf8')) : [];
-        return { offset: found.offset, segments: segments.length ? segments : [{ from: 0, shift: found.offset }] };
+        if (!found || Math.abs(found.offset) >= reach - 1) return null;
+        if (!split) return { offset: found.offset, scale: found.scale || 1, segments: null };
+        const segments = fs.existsSync(out) ? segmentsOf(fs.readFileSync(lines, 'utf8'), fs.readFileSync(out, 'utf8')) : [];
+        const kept = segments.length > 1 ? keptSegments(segments, cues, byTrack ? null : chapters || [], parts => fitScore(cues, speech, mover(0, 1, parts))) : null;
+        return kept && kept.length > 1 ? { offset: found.offset, scale: 1, segments: kept } : null;
       };
-      // Two runs (the dialogue lines, every line) agree when nine of ten dialogue lines get the same shift from both.
-      // Segments are tried first, and kept when they are more than one (an opening one release has and the other not);
-      // otherwise one shift is found again, which is the more precise (a 3.2 s late test subtitle: -3.74 s split,
-      // -2.99 s as one shift, against the audio).
-      const starts = vttCues(fs.readFileSync(timing, 'utf8')).map(([start]) => start);
-      const attempt = async split => {
-        const dialogue = await ask(timing, split), every = await ask(subtitlePath, split);
-        const same = starts.filter(start => Math.abs(shiftAt(dialogue.segments, start) - shiftAt(every.segments, start)) <= 0.5).length;
-        return { dialogue, every, same, agree: same >= starts.length * 0.9 };
-      };
-      let found = null, last = null;
-      for (const split of [true, false]) {
-        try { last = await attempt(split); if (last.agree && (!split || last.dialogue.segments.length > 1)) { found = last; break; } } catch (error) { if (!error.uncertain) throw error; }
-        if (abort.signal.aborted) throw Object.assign(new Error('취소했습니다.'), { canceled: true });
+      const reaches = [...new Set([60, 300, length].filter(reach => reach <= length))];
+      const asks = [...reaches.map(reach => ({ reach })), { lines: subtitlePath, reach: Math.min(300, length) }, ...[150, 300].filter(reach => reach <= length).map(reach => ({ reach, split: true })), ...(byTrack ? [{ reach: Math.min(150, length), frameRate: true }] : [])];
+      const candidates = [{ kind: 'none', offset: 0, scale: 1, segments: null }];
+      for (const [i, request] of asks.entries()) {
+        status(`${byTrack ? '사이트 자막 트랙' : '음성'}에 맞추는 중`, i / asks.length);
+        const found = await ask(request);
+        if (found) candidates.push({ kind: request.split ? 'segments' : request.frameRate ? 'frame-rate' : 'shift', ...found });
+        stopped();
       }
-      if (!found) {
-        throw unsure(last ? `${byTrack ? '사이트 자막 트랙' : '음성'}과 두 번 맞춘 결과가 서로 달라(대사 ${starts.length}줄 중 ${last.same}줄만 일치) 싱크를 확신할 수 없어 그대로 뒀어요.`
-          : 'ffsubsync가 결과를 믿기 어렵다고 판단해 싱크를 그대로 뒀어요.');
+      for (const candidate of candidates) candidate.score = fitScore(cues, speech, mover(candidate.offset, candidate.scale, candidate.segments));
+      const none = candidates[0], ranked = candidates.slice(1).sort((a, b) => b.score - a.score);
+      // Segments only when they fit clearly better than the best single shift (which is the more precise).
+      let chosen = ranked[0];
+      const single = ranked.find(candidate => !candidate.segments);
+      if (chosen?.segments && single && chosen.score - single.score < 0.02) chosen = single;
+      const fit = FIT[byTrack ? 'track' : 'audio'], method = byTrack ? 'track' : 'audio';
+      const summary = { none: Math.round(none.score * 1000) / 1000, chosen: chosen ? Math.round(chosen.score * 1000) / 1000 : null, tried: candidates.map(c => ({ kind: c.kind, offset: c.offset, scale: c.scale, segments: c.segments, score: Math.round(c.score * 1000) / 1000 })) };
+      if (!chosen || chosen.score < fit.floor) {
+        if (none.score >= fit.floor) return { offset: 0, scale: 1, segments: null, method, scores: summary, unchanged: true };
+        throw Object.assign(new Error('이 자막이 영상과 맞는 위치를 찾지 못해 그대로 뒀어요 (다른 판본이나 다른 회차의 자막일 수 있어요).'), { uncertain: true, scores: summary });
       }
-      const { dialogue, every } = found;
-      const segments = dialogue.segments.map(segment => ({ from: Math.round(segment.from * 100) / 100, shift: segment.shift }));
-      // The shift most lines take (the one said), and whether any line moves at all.
-      const count = new Map(); for (const start of starts) { const shift = shiftAt(segments, start); count.set(shift, (count.get(shift) || 0) + 1); }
-      const offset = [...count].sort((a, b) => b[1] - a[1])[0]?.[0] ?? dialogue.offset;
-      const result = { offset, scale: 1, segments: segments.length > 1 ? segments : null, method: byTrack ? 'track' : 'audio', checked: { dialogue: dialogue.offset, every: every.offset } };
-      if (segments.every(segment => Math.abs(segment.shift) < 0.3)) return { ...result, unchanged: true };
+      if (chosen.score < none.score + fit.margin) return { offset: 0, scale: 1, segments: null, method, scores: summary, unchanged: true };
+      const segments = chosen.segments ? chosen.segments.map(segment => ({ from: Math.round(segment.from * 100) / 100, shift: segment.shift })) : null;
+      // The shift most lines take (the one said).
+      const count = new Map(); for (const [start] of cues) { const shift = segments ? shiftAt(segments, start) : chosen.offset; count.set(shift, (count.get(shift) || 0) + 1); }
+      const offset = segments ? [...count].sort((a, b) => b[1] - a[1])[0][0] : chosen.offset;
+      const result = { offset, scale: segments ? 1 : chosen.scale, segments, method, scores: summary };
       return { ...result, ...retime({ subtitlePath, assPath, ...result }) };
     } finally {
       running = null;
@@ -341,4 +459,4 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
   return { installed, install, sync, retime, cancel, stop, running: () => Boolean(running) };
 }
 
-module.exports = { createSubtitleSync, retimeVtt, retimeAss, parseResult, vttCues, dialogueVtt, assDialogueVtt, segmentsOf, shiftAt };
+module.exports = { createSubtitleSync, retimeVtt, retimeAss, parseResult, vttCues, dialogueVtt, assDialogueVtt, assSpeech, segmentsOf, keptSegments, shiftAt, mover, merged, fitScore, spokenVtt };

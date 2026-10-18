@@ -583,13 +583,18 @@ function showSyncDone(text,undo){
 // The site's own dialogue track (Re:Anime / Miruro), timed to this video, to match against instead of the audio: a
 // full one ("Full Subtitles", "Dialogue") first, never signs, songs, forced or dubbed ones (Dubtitle, AI: timed to the
 // dub). Not for the site's own track on screen (it is the reference itself) or when none can be read.
-async function syncReference(subtitle){
-  if(subtitle.source==='reanime')return null;
-  const tracks=(currentPlaybackContext.subtitleTracks||[]).filter(track=>!/signs|songs|forced|dubtitle|\(ai\)|\bai\b|commentary/i.test(`${track.label||''} ${track.language||''}`));
-  const track=tracks.find(item=>/full|dialogue/i.test(item.label||''))||tracks[0];
-  if(!track)return null;
+// The site's tracks to choose the reference from (the main process takes the one with the most spoken lines, by their
+// content: Demon Slayer's "English (S&S)" was taken by its name before "English (Dialog - ENG)"): up to four, the
+// ones named as dialogue first and the ones named as signs or songs left out.
+async function syncReferences(subtitle){
+  if(subtitle.source==='reanime')return [];
+  const name=track=>`${track.label||''} ${track.language||''}`;
+  const tracks=(currentPlaybackContext.subtitleTracks||[]).filter(track=>!/signs|songs|s&s|forced|dubtitle|\(ai\)|\bai\b|commentary/i.test(name(track)))
+    .sort((a,b)=>Number(/full|dialog/i.test(name(b)))-Number(/full|dialog/i.test(name(a)))).slice(0,4);
+  const files=[];
   // With its ASS (when the track is one), whose styles tell its opening, ending and sign lines from the spoken ones.
-  try{const file=await trackFile(track);return file?.path?{path:file.path,assPath:file.assPath||null}:null}catch{return null}
+  for(const track of tracks){try{const file=await trackFile(track);if(file?.path)files.push({path:file.path,assPath:file.assPath||null})}catch{}}
+  return files;
 }
 // How a sync moved the lines: "1.05초 앞당김", or by segments "0:00~ 1.01초 앞당김 · 2:08~ 89.25초 늦춤".
 function syncMoved(result){
@@ -604,16 +609,17 @@ async function runSubtitleSync(auto=false){
   if(auto)$('#subtitleState').textContent='자막 싱크 확인 중...';
   const quiet=()=>{if(currentSubtitle===subtitle&&!translatingNow())$('#subtitleState').textContent=`${subtitle.label} 적용됨`};
   try{
-    const reference=await syncReference(subtitle);
-    const result=await window.lilac.syncSubtitle({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,assPath:subtitle.assPath||null,timingPath:subtitle.from||null,referencePath:reference?.path||null,referenceAssPath:reference?.assPath||null,duration:playbackDuration()});
+    // chapters: the opening and ending found for the episode (AniSkip), where a sync against the audio may split.
+    const references=await syncReferences(subtitle),chapters=(skipSegments||[]).filter(item=>['op','ed'].includes(item.type)).map(({type,startTime,endTime})=>({type,startTime,endTime}));
+    const result=await window.lilac.syncSubtitle({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,assPath:subtitle.assPath||null,timingPath:subtitle.from||null,references,chapters,duration:playbackDuration()});
     if(result?.canceled){if(!auto)toast('자막 싱크 맞추기를 취소했습니다.');quiet();return}
     if(requestId!==playbackRequestId||currentSubtitle!==subtitle){
       // Its translation came on meanwhile (timed as this file): the translation gets its own run.
       if(requestId===playbackRequestId&&currentSubtitle?.from===subtitle.path){syncChecked.delete(subtitle.path);checkSubtitleSync(currentSubtitle)}
       return;
     }
-    // Within 0.3 s: the subtitle stays as it is.
-    if(result.unchanged){quiet();if(!auto)toast(`자막 싱크가 이미 잘 맞아요 (${Math.abs(result.offset).toFixed(2)}초 차이)`);return}
+    // No candidate fits clearly better than the subtitle as it is: it stays.
+    if(result.unchanged){quiet();if(!auto)toast('자막 싱크가 이미 잘 맞아요');return}
     syncChecked.add(result.path);
     const offset=result.offset,moved=syncMoved(result);
     const manual=Number(localStorage.getItem('subtitleSync')||0);if(manual)setSubtitleSync(0);
@@ -645,25 +651,27 @@ async function runSubtitleSync(auto=false){
     const message=ipcMessage(error),unsure=/그대로 뒀어요/.test(message);if(auto||unsure)quiet();else $('#subtitleState').textContent='자막 싱크를 맞추지 못했습니다.';
     if(!auto)toast(unsure?`자막 싱크: ${message}`:`자막 싱크 맞추기 실패: ${message}`);
   }}
-  finally{subtitleSyncRun=null;renderSyncButton()}
+  finally{subtitleSyncRun=null;renderSyncButton();if(waitingSync){const next=waitingSync;waitingSync=null;checkSubtitleSync(next)}}
 }
-// Each subtitle put on is synced once in the background, a little after it is on (the stream's first segments come
-// first; the episode's length is needed for the progress). A translation is timed as the file it was made from, so it
-// is not run again when that file was.
-function checkSubtitleSync(subtitle,tries=0){
+// Each subtitle put on is synced once in the background, as soon as it is on and the episode's length is known (for
+// the audio's progress), or right after a sync still running. A translation is timed as the file it was made from,
+// so it is not run again when that file was.
+let waitingSync=null;
+function checkSubtitleSync(subtitle){
   if(localStorage.getItem('subtitleSyncCheck')==='false'||!subtitle?.path||syncChecked.has(subtitle.path)||subtitle.from&&syncChecked.has(subtitle.from)||subtitle.label?.endsWith(SYNCED))return;
-  const requestId=playbackRequestId;clearTimeout(checkSubtitleSync.timer);
-  checkSubtitleSync.timer=setTimeout(()=>{
-    if(requestId!==playbackRequestId||currentSubtitle!==subtitle||!syncableSubtitle())return;
-    // Another sync still running, or the length not known yet: tried again a little later.
-    if(subtitleSyncRun||!playbackDuration()){if(tries<10)checkSubtitleSync(subtitle,tries+1);return}
+  const requestId=playbackRequestId,video=$('#video');
+  const go=()=>{
+    if(requestId!==playbackRequestId||currentSubtitle!==subtitle||!syncableSubtitle()||syncChecked.has(subtitle.path))return;
+    if(subtitleSyncRun){waitingSync=subtitle;return}
+    if(!playbackDuration()){video.addEventListener('durationchange',go,{once:true});return}
     syncChecked.add(subtitle.path);runSubtitleSync(true);
-  },tries?5000:6000);
+  };
+  go();
 }
 $('#autoSyncSubtitle').onclick=()=>runSubtitleSync();
-// ffsubsync is installed in the background half a minute after start (after the start's own downloads), while 자동으로
-// 맞추기 is on, so the first sync does not wait for it.
-setTimeout(()=>{if(localStorage.getItem('subtitleSyncCheck')!=='false')window.lilac.prepareSubtitleSync?.().catch(()=>{})},30000);
+// ffsubsync is installed in the background as the app starts, while 자동으로 맞추기 is on, so the first sync does
+// not wait for it.
+if(localStorage.getItem('subtitleSyncCheck')!=='false')window.lilac.prepareSubtitleSync?.().catch(()=>{});
 $('#subtitleSyncCheck').checked=localStorage.getItem('subtitleSyncCheck')!=='false';
 $('#subtitleSyncCheck').onchange=event=>localStorage.setItem('subtitleSyncCheck',String(event.target.checked));
 async function ensureSubtitle(stream,title,episode,{skipSaved=false}={}){

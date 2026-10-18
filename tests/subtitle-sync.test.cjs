@@ -58,7 +58,8 @@ test('a site track ASS gives only its spoken lines: opening, ending and sign sty
   const { assDialogueVtt } = require('../electron/subtitle-sync.cjs');
   const time = t => `0:${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}.00`;
   const row = (i, style, text) => `Dialogue: 0,${time(10 + i * 2)},${time(11 + i * 2)},${style},,0,0,0,,${text}`;
-  const styles = ['Default', 'OP Romaji', 'ED English-furigana', 'Signs', 'Default-Alt', 'Default'];
+  // "Typeset": a sign style whose name says nothing, told by its placed lines.
+  const styles = ['Default', 'OP Romaji', 'ED English-furigana', 'Signs', 'Default-Alt', 'Typeset'];
   const lines = Array.from({ length: 60 }, (_, i) => row(i, styles[i % 6], i % 6 === 5 ? '{\\pos(10,10)}Sign text' : `line ${i}`));
   const out = assDialogueVtt(`[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${lines.join('\n')}\n`);
   const kept = out.split('\n').filter(line => /^line /.test(line)).map(line => Number(line.slice(5)));
@@ -77,4 +78,32 @@ test('segments: a line moves by the shift of the segment its start is in, its en
   const before = 'WEBVTT\n\n00:00:10.000 --> 00:00:11.000\na\n\n00:00:20.000 --> 00:00:21.000\nb\n\n00:02:00.000 --> 00:02:01.000\nc\n';
   const after = 'WEBVTT\n\n00:00:09.000 --> 00:00:10.000\na\n\n00:00:19.000 --> 00:00:20.000\nb\n\n00:03:29.250 --> 00:03:30.250\nc\n';
   assert.deepEqual(segmentsOf(before, after), [{ from: 10, shift: -1 }, { from: 120, shift: 89.25 }]);
+});
+
+test('fit score: the share of the lines that falls on the reference speech, moved as a candidate says', () => {
+  const { fitScore, merged, mover } = require('../electron/subtitle-sync.cjs');
+  const speech = merged([[10, 12], [11, 13], [20, 22]]);
+  assert.deepEqual(speech, [[10, 13], [20, 22]]);
+  const cues = [[9, 11], [19, 21]];
+  assert.equal(fitScore(cues, speech), 0.5);
+  assert.equal(fitScore(cues, speech, mover(1, 1)), 1);
+  assert.equal(fitScore(cues, speech, mover(500, 1)), 0);
+});
+
+test('segments: stray blocks between the right ones are let go by the fit, short or out-of-order ones are not kept', () => {
+  const { keptSegments, fitScore, mover } = require('../electron/subtitle-sync.cjs');
+  // Lines at uneven times over 20 minutes (as speech is: an even rhythm would fit any shift of its step); the right
+  // answer: 0 s, then +3 s from the first line at 600 s or after.
+  let seed = 11; const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const cues = []; for (let t = 1; t < 1200; t += 2 + random() * 6) cues.push([t, t + 1 + random() * 2]);
+  const turn = cues.find(([start]) => start >= 600)[0];
+  const truth = [{ from: 0, shift: 0 }, { from: turn, shift: 3 }];
+  const speech = cues.map(([s, e]) => [s + (s >= 600 ? 3 : 0), e + (s >= 600 ? 3 : 0)]);
+  const score = parts => fitScore(cues, speech, mover(0, 1, parts));
+  // Two blocks of a minute changing places, as ffsubsync's split did on Horimiya 1.
+  const stray = [{ from: 0, shift: 0 }, { from: 300, shift: 60 }, { from: 360, shift: -60 }, { from: 420, shift: 0.1 }, { from: turn, shift: 3 }];
+  assert.deepEqual(keptSegments(stray, cues, null, score), truth);
+  // Against the audio a segment must start at an opening or ending: none near 600 s, so nothing is kept.
+  assert.equal(keptSegments(truth, cues, [{ startTime: 90, endTime: 180 }], score), null);
+  assert.deepEqual(keptSegments(truth, cues, [{ startTime: 510, endTime: 598 }], score), truth);
 });
