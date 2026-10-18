@@ -1,0 +1,29 @@
+# Runs tests/subtitle-sync.live.cjs on the Macs the app is built for (Apple Silicon and Intel): ffsubsync installed the
+# way the app does it (uv, its own Python 3.12) and a subtitle 3.2 s late fixed against real speech. Run by hand
+# (Actions > Subtitle sync check > Run workflow).
+name: Subtitle sync check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Only ffmpeg-static is needed: Electron's own download is skipped.
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: node tests/subtitle-sync.live.cjs
