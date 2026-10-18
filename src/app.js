@@ -580,6 +580,22 @@ function showSyncDone(text,undo){
   $('#subtitleOfferApply').textContent='되돌리기';$('#subtitleOfferApply').onclick=()=>{box.classList.add('hidden');if(!undo())toast('이미 다른 자막으로 바뀌어 되돌릴 수 없습니다.')};
   $('#subtitleOfferDismiss').textContent='확인';$('#subtitleOfferDismiss').onclick=()=>box.classList.add('hidden');
 }
+// The site's own dialogue track (Re:Anime / Miruro), timed to this video, to match against instead of the audio: a
+// full one ("Full Subtitles", "Dialogue") first, never signs, songs, forced or dubbed ones (Dubtitle, AI: timed to the
+// dub). Not for the site's own track on screen (it is the reference itself) or when none can be read.
+async function syncReference(subtitle){
+  if(subtitle.source==='reanime')return null;
+  const tracks=(currentPlaybackContext.subtitleTracks||[]).filter(track=>!/signs|songs|forced|dubtitle|\(ai\)|\bai\b|commentary/i.test(`${track.label||''} ${track.language||''}`));
+  const track=tracks.find(item=>/full|dialogue/i.test(item.label||''))||tracks[0];
+  if(!track)return null;
+  // With its ASS (when the track is one), whose styles tell its opening, ending and sign lines from the spoken ones.
+  try{const file=await trackFile(track);return file?.path?{path:file.path,assPath:file.assPath||null}:null}catch{return null}
+}
+// How a sync moved the lines: "1.05초 앞당김", or by segments "0:00~ 1.01초 앞당김 · 2:08~ 89.25초 늦춤".
+function syncMoved(result){
+  const say=shift=>`${Math.abs(shift).toFixed(2)}초 ${shift<0?'앞당김':'늦춤'}`,clock=time=>`${Math.floor(time/60)}:${String(Math.floor(time%60)).padStart(2,'0')}`;
+  return result.segments?.length>1?`구간별 ${result.segments.map(segment=>`${clock(segment.from)}~ ${say(segment.shift)}`).join(' · ')}`:say(result.offset);
+}
 // auto: started by itself for the subtitle put on, not by the button: it says nothing unless it changes the subtitle.
 async function runSubtitleSync(auto=false){
   if(subtitleSyncRun){if(!auto)window.lilac.cancelSubtitleSync();return}
@@ -588,7 +604,8 @@ async function runSubtitleSync(auto=false){
   if(auto)$('#subtitleState').textContent='자막 싱크 확인 중...';
   const quiet=()=>{if(currentSubtitle===subtitle&&!translatingNow())$('#subtitleState').textContent=`${subtitle.label} 적용됨`};
   try{
-    const result=await window.lilac.syncSubtitle({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,assPath:subtitle.assPath||null,timingPath:subtitle.from||null,duration:playbackDuration()});
+    const reference=await syncReference(subtitle);
+    const result=await window.lilac.syncSubtitle({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,assPath:subtitle.assPath||null,timingPath:subtitle.from||null,referencePath:reference?.path||null,referenceAssPath:reference?.assPath||null,duration:playbackDuration()});
     if(result?.canceled){if(!auto)toast('자막 싱크 맞추기를 취소했습니다.');quiet();return}
     if(requestId!==playbackRequestId||currentSubtitle!==subtitle){
       // Its translation came on meanwhile (timed as this file): the translation gets its own run.
@@ -598,11 +615,11 @@ async function runSubtitleSync(auto=false){
     // Within 0.3 s: the subtitle stays as it is.
     if(result.unchanged){quiet();if(!auto)toast(`자막 싱크가 이미 잘 맞아요 (${Math.abs(result.offset).toFixed(2)}초 차이)`);return}
     syncChecked.add(result.path);
-    const offset=result.offset,moved=Math.abs(offset)<0.05&&Math.abs(result.scale-1)<0.0005?'이미 잘 맞아요':`${Math.abs(offset).toFixed(2)}초 ${offset<0?'앞당김':'늦춤'}`;
+    const offset=result.offset,moved=syncMoved(result);
     const manual=Number(localStorage.getItem('subtitleSync')||0);if(manual)setSubtitleSync(0);
-    const done=`자막 싱크를 ${auto?'자동으로 ':''}맞췄어요 (${moved}${manual?' · 수동 싱크 0으로':''})`;
+    const done=`자막 싱크를 ${auto?'자동으로 ':''}맞췄어요 (${moved}${result.method==='track'?' · 사이트 자막 기준':''}${manual?' · 수동 싱크 0으로':''})`;
     if(translating?.path===subtitle.path){
-      const fix={offset,scale:result.scale};syncFixes.set(subtitle.path,fix);subtitle.timeFix=fix;applyVttLayout();window.LilacAss?.setOffset(Math.round(offset*1000));
+      const fix={offset,scale:result.scale,segments:result.segments||null};syncFixes.set(subtitle.path,fix);subtitle.timeFix=fix;applyVttLayout();window.LilacAss?.setOffset(Math.round(offset*1000));
       showSyncDone(`${done} · 번역이 끝나면 번역 자막에도 적용돼요`,()=>{
         if(syncFixes.get(subtitle.path)!==fix||currentSubtitle!==subtitle)return false;
         syncFixes.delete(subtitle.path);subtitle.timeFix=null;if(manual)setSubtitleSync(manual);else{applyVttLayout();window.LilacAss?.setOffset(0)}
@@ -625,7 +642,7 @@ async function runSubtitleSync(auto=false){
     });
   }catch(error){if(requestId===playbackRequestId){
     // A result it could not be sure of (or a failed run) leaves the subtitle as it is: said only when asked by the button.
-    const message=ipcMessage(error),unsure=/확신할 수 없어/.test(message);if(auto||unsure)quiet();else $('#subtitleState').textContent='자막 싱크를 맞추지 못했습니다.';
+    const message=ipcMessage(error),unsure=/그대로 뒀어요/.test(message);if(auto||unsure)quiet();else $('#subtitleState').textContent='자막 싱크를 맞추지 못했습니다.';
     if(!auto)toast(unsure?`자막 싱크: ${message}`:`자막 싱크 맞추기 실패: ${message}`);
   }}
   finally{subtitleSyncRun=null;renderSyncButton()}

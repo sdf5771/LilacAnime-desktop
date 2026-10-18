@@ -45,7 +45,7 @@ const assStamp = t => { const cs = Math.round(t * 100); return `${Math.floor(cs 
   installSeconds = (Date.now() - started) / 1000; started = Date.now();
   assert.ok(sync.installed(), 'ffsubsync is installed');
   const result = await sync.sync({ videoUrl, subtitlePath: vtt, assPath: ass, duration: LENGTH, status: (message, progress) => console.log(`  sync: ${message}${progress == null ? '' : ` ${Math.round(progress * 100)}%`}`) });
-  console.log('ffsubsync:', JSON.stringify({ offset: result.offset, scale: result.scale, checked: result.checked }), `install ${installSeconds.toFixed(0)} s, sync ${((Date.now() - started) / 1000).toFixed(0)} s`);
+  console.log("ffsubsync:", JSON.stringify({ offset: result.offset, scale: result.scale, segments: result.segments, checked: result.checked }), `install ${installSeconds.toFixed(0)} s, sync ${((Date.now() - started) / 1000).toFixed(0)} s`);
   assert.ok(Math.abs(result.offset + LATE) <= 0.6 && result.scale === 1, 'ffsubsync moves the subtitle back');
   const fixed = vttCues(fs.readFileSync(result.path, 'utf8'));
   assert.ok(Math.abs(fixed[0][0] - STARTS[0]) <= 0.6, `first line at ${fixed[0][0]} s`);
@@ -54,6 +54,13 @@ const assStamp = t => { const cs = Math.round(t * 100); return `${Math.floor(cs 
   const again = await sync.sync({ videoUrl, subtitlePath: result.path, duration: LENGTH });
   console.log('second run on the fixed copy:', JSON.stringify({ offset: again.offset, unchanged: again.unchanged || false }));
   assert.ok(again.unchanged, 'the fixed copy is left as it is');
+  // A site track timed to the video (here: the true times, other words) as the reference instead of the audio.
+  const track = path.join(dir, 'track.vtt');
+  fs.writeFileSync(track, `WEBVTT\n\n${STARTS.map((start, i) => `${stamp(start, '.')} --> ${stamp(start + seconds(used[i]), '.')}\nreference ${i + 1}\n`).join('\n')}`);
+  started = Date.now();
+  const byTrack = await sync.sync({ videoUrl, subtitlePath: vtt, referencePath: track, duration: LENGTH });
+  console.log('by the site track:', JSON.stringify({ offset: byTrack.offset, method: byTrack.method, checked: byTrack.checked }), `${((Date.now() - started) / 1000).toFixed(1)} s`);
+  assert.ok(byTrack.method === 'track' && Math.abs(byTrack.offset + LATE) <= 0.05, 'the site track gives the exact shift');
   console.log('SUBTITLE_SYNC_LIVE_OK');
   fs.rmSync(dir, { recursive: true, force: true });
 })().catch(error => { console.error(error); process.exit(1); });

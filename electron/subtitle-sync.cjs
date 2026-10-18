@@ -60,14 +60,72 @@ function dialogueVtt(text) {
   return `WEBVTT\n\n${use.map(cue => `${cue.timing}\n${cue.body || 'x'}\n`).join('\n')}`;
 }
 
-// time → time * scale + offset (ffsubsync's order: the scale first, then the offset), on the timing lines only.
-function retimeVtt(text, offset, scale = 1) {
-  const stamp = /((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})/g;
-  return text.split('\n').map(line => line.includes('-->') ? line.replace(stamp, value => vttStamp(seconds(value) * scale + offset)) : line).join('\n');
+// The styles of ASS lines that are not speech: opening and ending songs (a fansub's "OP Romaji", "ED English"),
+// signs, songs, karaoke, titles, notes. Toradora!'s English site track has the opening in romaji, kanji and English,
+// 64 lines in a minute and a half nobody speaks in.
+const NOT_SPEECH_STYLE = /(^|[^a-z])(op|ed)([^a-z]|$)|opening|ending|sign|song|karaoke|lyric|title|insert|logo|eyecatch|preview|note|kfx/i;
+// An ASS file's spoken lines as a VTT for ffsubsync: by the style, and not the lines placed or drawn on the picture
+// (\pos, \move, \an7-9, drawings), which are signs. null when it has fewer than 20.
+function assDialogueVtt(text) {
+  let fields = null, events = false; const cues = [];
+  for (const line of String(text).replace(/^﻿/, '').split(/\r?\n/)) {
+    if (/^\[events\]/i.test(line)) { events = true; continue; }
+    if (/^\[/.test(line)) { events = false; continue; }
+    if (!events) continue;
+    if (/^format:/i.test(line)) { fields = line.slice(line.indexOf(':') + 1).split(',').map(field => field.trim().toLowerCase()); continue; }
+    if (!/^dialogue:/i.test(line) || !fields) continue;
+    const parts = line.slice(line.indexOf(':') + 1).split(','), row = {};
+    fields.forEach((field, i) => { row[field] = i === fields.length - 1 ? parts.slice(i).join(',') : (parts[i] || '').trim(); });
+    if (NOT_SPEECH_STYLE.test(row.style || '') || /\\(pos|move|an[789]|p[1-9])/.test(row.text || '')) continue;
+    const words = String(row.text || '').replace(/\{[^}]*\}/g, '').replace(/\\[Nn]/g, ' ').replace(/\\h/g, ' ').trim();
+    const start = seconds(String(row.start || '').replace(/:(\d+)$/, '.$1')), end = seconds(String(row.end || '').replace(/:(\d+)$/, '.$1'));
+    if (words && end > start) cues.push([start, end, words]);
+  }
+  cues.sort((a, b) => a[0] - b[0]);
+  return cues.length >= 20 ? `WEBVTT\n\n${cues.map(([start, end, words]) => `${vttStamp(start)} --> ${vttStamp(end)}\n${words}\n`).join('\n')}` : null;
 }
-function retimeAss(text, offset, scale = 1) {
+// The spoken lines of a subtitle: from the ASS beside it when there is one (its styles tell), else from the VTT.
+function spokenVtt(vttPath, assPath = null) {
+  const ass = assPath && fs.existsSync(assPath) ? assPath : vttPath.replace(/\.vtt$/i, '.ass');
+  if (ass !== vttPath && fs.existsSync(ass)) { const found = assDialogueVtt(fs.readFileSync(ass, 'utf8')); if (found) return found; }
+  return dialogueVtt(fs.readFileSync(vttPath, 'utf8'));
+}
+
+// How much a line moves: one offset (and scale) for the whole file, or by segments [{from, shift}] in the file's own
+// time (a site's video with an opening the subtitle's release has not): a line takes the shift of the segment its
+// start is in, and its end moves with it.
+const shiftAt = (segments, time) => { let shift = segments[0].shift; for (const segment of segments) { if (segment.from <= time + 1e-6) shift = segment.shift; else break; } return shift; };
+const mover = (offset, scale, segments) => segments?.length > 1 ? (time, start) => time + shiftAt(segments, start) : time => time * scale + offset;
+// time → time * scale + offset (ffsubsync's order: the scale first, then the offset), on the timing lines only.
+function retimeVtt(text, offset, scale = 1, segments = null) {
+  const move = mover(offset, scale, segments), stamp = /((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})/g;
+  return text.split('\n').map(line => {
+    if (!line.includes('-->')) return line;
+    const start = seconds(line.match(stamp)?.[0] || '0');
+    return line.replace(stamp, value => vttStamp(move(seconds(value), start)));
+  }).join('\n');
+}
+function retimeAss(text, offset, scale = 1, segments = null) {
+  const move = mover(offset, scale, segments), time = value => seconds(value.replace(/:(\d+)$/, '.$1'));
   return text.replace(/^((?:Dialogue|Comment):\s*[^,\r\n]*,)(\d+:\d{2}:\d{2}[.:]\d{1,3}),(\d+:\d{2}:\d{2}[.:]\d{1,3})/gim,
-    (_, head, start, end) => `${head}${assStamp(seconds(start.replace(/:(\d+)$/, '.$1')) * scale + offset)},${assStamp(seconds(end.replace(/:(\d+)$/, '.$1')) * scale + offset)}`);
+    (_, head, start, end) => `${head}${assStamp(move(time(start), time(start)))},${assStamp(move(time(end), time(start)))}`);
+}
+// The segments ffsubsync's split alignment made: each line of the file it was given against the same line in what it
+// wrote, a new segment where the shift changes by more than 0.2 s.
+function segmentsOf(before, after) {
+  const read = text => String(text).replace(/\r/g, '').split(/\n{2,}/).map(block => {
+    const lines = block.split('\n'), at = lines.findIndex(line => line.includes('-->'));
+    return at < 0 ? null : { start: seconds(lines[at].split('-->')[0]), text: lines.slice(at + 1).join('\n').trim() };
+  }).filter(Boolean);
+  const a = read(before), b = read(after), segments = [], taken = new Set();
+  for (const [i, line] of a.entries()) {
+    const k = b[i]?.text === line.text && !taken.has(i) ? i : b.findIndex((other, j) => !taken.has(j) && other.text === line.text);
+    if (k < 0) continue;
+    taken.add(k);
+    const shift = Math.round((b[k].start - line.start) * 100) / 100;
+    if (!segments.length || Math.abs(shift - segments[segments.length - 1].shift) > 0.2) segments.push({ from: line.start, shift });
+  }
+  return segments;
 }
 // The file's bytes are kept: UTF-16 is read as such, anything else byte for byte (the times are ASCII), so a CP949
 // or Shift-JIS ASS comes out in its own encoding.
@@ -183,35 +241,83 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
   // twice, with the dialogue lines only (captions, lyrics and signs left out) and with every line; the result counts
   // only when both say the same, as a wrong match does not hold when the lines change. Under 0.3 s the subtitle is left
   // as it is.
-  async function sync({ videoUrl, headers = {}, subtitlePath, assPath = null, timingPath = null, duration = 0, status = () => {} }) {
+  // referencePath: a dialogue track of the site's own (Re:Anime / Miruro), timed to this video: matched against its
+  // lines instead of the audio (ffsubsync's own advice, "the most accurate"), the audio not read at all. On Toradora!
+  // 1 its English track was 0.14 s off the audio with a score four times the Jimaku file's, and gave -0.97 s in a
+  // second. Either way ffsubsync leaves out a result it does not trust itself (--skip-sync-on-low-quality: a wrong
+  // way round match, or one over 30 s), and that one is not used either.
+  // Against a site track the shift may change along the episode: Toradora! 1 there has its opening (89 s) after the
+  // cold open, where the Netflix-made Jimaku file has none, so every line from the opening on came 89 s early and no
+  // one shift could fix it (-1.24 s and +28 s were both wrong). So the track is matched in segments (ffsubsync's
+  // --split-penalty, up to 150 s): there it found -1.01 s before the opening and +89.25 s after it, as the lines say.
+  // The two runs then agree when nine of ten dialogue lines get the same shift from both. The track's own opening,
+  // ending and sign lines are left out by their ASS style. The audio is matched with one shift, as before.
+  async function sync({ videoUrl, headers = {}, subtitlePath, assPath = null, timingPath = null, referencePath = null, referenceAssPath = null, duration = 0, status = () => {} }) {
     if (running) throw new Error('이미 자막 싱크를 맞추는 중입니다.');
-    if (!/^(https?|file):/i.test(videoUrl || '')) throw new Error('이 영상은 자동 싱크를 쓸 수 없습니다.');
+    const byTrack = Boolean(referencePath && fs.existsSync(referencePath));
+    if (!byTrack && !/^(https?|file):/i.test(videoUrl || '')) throw new Error('이 영상은 자동 싱크를 쓸 수 없습니다.');
     if (!subtitlePath || !fs.existsSync(subtitlePath)) throw new Error('자막 파일이 없습니다.');
     const abort = new AbortController(), work = fs.mkdtempSync(path.join(os.tmpdir(), 'lilac-sync-'));
     running = abort;
     try {
       if (!installed()) { status('ffsubsync 설치 준비 중 (처음 한 번)', 0); await install((message, progress) => status(`${message} (처음 한 번)`, progress)); }
       if (abort.signal.aborted) throw Object.assign(new Error('취소했습니다.'), { canceled: true });
-      const wav = path.join(work, 'audio.wav');
-      status('영상 음성 읽는 중', 0);
-      await extractAudio(videoUrl, headers, Number(duration) || 0, wav, status, abort.signal);
-      status('ffsubsync로 대사 위치 맞추는 중', null);
-      const timing = path.join(work, 'dialogue.vtt'), center = path.join(work, 'center.wav');
-      fs.writeFileSync(timing, dialogueVtt(fs.readFileSync(timingPath && fs.existsSync(timingPath) ? timingPath : subtitlePath, 'utf8')));
-      let centerOk = true;
-      try { await run(ffmpegPath, ['-hide_banner', '-nostdin', '-y', '-i', wav, '-af', 'dialoguenhance=original=0:enhance=3,pan=mono|c0=FC', '-ar', '16000', '-c:a', 'pcm_s16le', center], { signal: abort.signal }); } catch (error) { if (abort.signal.aborted) throw error; centerOk = false; }
-      const ask = async lines => {
-        const output = await run(exe, [centerOk ? center : wav, '-i', lines, '-o', path.join(work, 'out.vtt'), '--ffmpeg-path', path.dirname(ffmpegPath), '--no-fix-framerate'], {
+      const timing = path.join(work, 'dialogue.vtt'), wav = path.join(work, 'audio.wav'), center = path.join(work, 'center.wav'), reference = path.join(work, 'reference.vtt');
+      const fromTiming = timingPath && fs.existsSync(timingPath);
+      fs.writeFileSync(timing, spokenVtt(fromTiming ? timingPath : subtitlePath, fromTiming ? null : assPath));
+      let against = reference;
+      if (byTrack) {
+        fs.writeFileSync(reference, spokenVtt(referencePath, referenceAssPath));
+        status('사이트 자막 트랙에 맞추는 중', null);
+      } else {
+        status('영상 음성 읽는 중', 0);
+        await extractAudio(videoUrl, headers, Number(duration) || 0, wav, status, abort.signal);
+        status('ffsubsync로 대사 위치 맞추는 중', null);
+        against = center;
+        try { await run(ffmpegPath, ['-hide_banner', '-nostdin', '-y', '-i', wav, '-af', 'dialoguenhance=original=0:enhance=3,pan=mono|c0=FC', '-ar', '16000', '-c:a', 'pcm_s16le', center], { signal: abort.signal }); } catch (error) { if (abort.signal.aborted) throw error; against = wav; }
+      }
+      const unsure = message => Object.assign(new Error(message), { uncertain: true });
+      // One run: the shift, and its segments when split (read from the file ffsubsync wrote), up to 150 s either way:
+      // with ffsubsync's 60 s the audio could not reach Toradora!'s +89.3 s (score 59425) and gave -1.32 s (17227).
+      let runs = 0;
+      const ask = async (lines, split) => {
+        const out = path.join(work, `out-${++runs}.vtt`);
+        const output = await run(exe, [against, '-i', lines, '-o', out, '--ffmpeg-path', path.dirname(ffmpegPath), '--no-fix-framerate', '--skip-sync-on-low-quality',
+          '--max-offset-seconds', '150', '--quality-max-offset-seconds', '150', ...(split ? ['--split-penalty'] : [])], {
           signal: abort.signal, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', COLUMNS: '400', NO_COLOR: '1', TERM: 'dumb' },
         });
+        if (/leaving subtitles unmodified/i.test(output.replace(/\s+/g, ' '))) throw unsure('ffsubsync가 결과를 믿기 어렵다고 판단해 싱크를 그대로 뒀어요.');
         const found = parseResult(output);
         if (!found) throw new Error('ffsubsync가 결과를 알려 주지 않았습니다.');
-        return found.offset;
+        const segments = split && fs.existsSync(out) ? segmentsOf(fs.readFileSync(lines, 'utf8'), fs.readFileSync(out, 'utf8')) : [];
+        return { offset: found.offset, segments: segments.length ? segments : [{ from: 0, shift: found.offset }] };
       };
-      const dialogue = await ask(timing), every = await ask(subtitlePath);
-      if (Math.abs(dialogue - every) > 0.5) throw Object.assign(new Error(`음성 분석 결과가 서로 달라(${dialogue.toFixed(1)}초 / ${every.toFixed(1)}초) 싱크를 확신할 수 없어 그대로 뒀어요.`), { uncertain: true });
-      const offset = Math.round(dialogue * 100) / 100, result = { offset, scale: 1, checked: { dialogue, every } };
-      if (Math.abs(offset) < 0.3) return { ...result, unchanged: true };
+      // Two runs (the dialogue lines, every line) agree when nine of ten dialogue lines get the same shift from both.
+      // Segments are tried first, and kept when they are more than one (an opening one release has and the other not);
+      // otherwise one shift is found again, which is the more precise (a 3.2 s late test subtitle: -3.74 s split,
+      // -2.99 s as one shift, against the audio).
+      const starts = vttCues(fs.readFileSync(timing, 'utf8')).map(([start]) => start);
+      const attempt = async split => {
+        const dialogue = await ask(timing, split), every = await ask(subtitlePath, split);
+        const same = starts.filter(start => Math.abs(shiftAt(dialogue.segments, start) - shiftAt(every.segments, start)) <= 0.5).length;
+        return { dialogue, every, same, agree: same >= starts.length * 0.9 };
+      };
+      let found = null, last = null;
+      for (const split of [true, false]) {
+        try { last = await attempt(split); if (last.agree && (!split || last.dialogue.segments.length > 1)) { found = last; break; } } catch (error) { if (!error.uncertain) throw error; }
+        if (abort.signal.aborted) throw Object.assign(new Error('취소했습니다.'), { canceled: true });
+      }
+      if (!found) {
+        throw unsure(last ? `${byTrack ? '사이트 자막 트랙' : '음성'}과 두 번 맞춘 결과가 서로 달라(대사 ${starts.length}줄 중 ${last.same}줄만 일치) 싱크를 확신할 수 없어 그대로 뒀어요.`
+          : 'ffsubsync가 결과를 믿기 어렵다고 판단해 싱크를 그대로 뒀어요.');
+      }
+      const { dialogue, every } = found;
+      const segments = dialogue.segments.map(segment => ({ from: Math.round(segment.from * 100) / 100, shift: segment.shift }));
+      // The shift most lines take (the one said), and whether any line moves at all.
+      const count = new Map(); for (const start of starts) { const shift = shiftAt(segments, start); count.set(shift, (count.get(shift) || 0) + 1); }
+      const offset = [...count].sort((a, b) => b[1] - a[1])[0]?.[0] ?? dialogue.offset;
+      const result = { offset, scale: 1, segments: segments.length > 1 ? segments : null, method: byTrack ? 'track' : 'audio', checked: { dialogue: dialogue.offset, every: every.offset } };
+      if (segments.every(segment => Math.abs(segment.shift) < 0.3)) return { ...result, unchanged: true };
       return { ...result, ...retime({ subtitlePath, assPath, ...result }) };
     } finally {
       running = null;
@@ -220,12 +326,13 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
   }
   // A retimed copy of a subtitle (and its ASS) by an offset and scale found before: a translation finished after its
   // source was synced gets the same fix without running ffsubsync again.
-  function retime({ subtitlePath, assPath = null, offset = 0, scale = 1 }) {
+  function retime({ subtitlePath, assPath = null, offset = 0, scale = 1, segments = null }) {
     if (!subtitlePath || !fs.existsSync(subtitlePath) || !Number.isFinite(offset) || !(scale > 0)) throw new Error('자막 파일이 없습니다.');
+    const parts = Array.isArray(segments) && segments.length > 1 && segments.every(segment => Number.isFinite(segment?.from) && Number.isFinite(segment?.shift)) ? segments : null;
     const vtt = syncedName(subtitlePath);
-    rewrite(subtitlePath, vtt, text => retimeVtt(text, offset, scale));
+    rewrite(subtitlePath, vtt, text => retimeVtt(text, offset, scale, parts));
     let ass = null;
-    if (assPath && fs.existsSync(assPath)) { ass = syncedName(assPath); rewrite(assPath, ass, text => retimeAss(text, offset, scale)); }
+    if (assPath && fs.existsSync(assPath)) { ass = syncedName(assPath); rewrite(assPath, ass, text => retimeAss(text, offset, scale, parts)); }
     return { path: vtt, url: pathToFileURL(vtt).href, assPath: ass, assUrl: ass ? pathToFileURL(ass).href : null };
   }
 
@@ -234,4 +341,4 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
   return { installed, install, sync, retime, cancel, stop, running: () => Boolean(running) };
 }
 
-module.exports = { createSubtitleSync, retimeVtt, retimeAss, parseResult, vttCues, dialogueVtt };
+module.exports = { createSubtitleSync, retimeVtt, retimeAss, parseResult, vttCues, dialogueVtt, assDialogueVtt, segmentsOf, shiftAt };

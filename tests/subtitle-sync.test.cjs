@@ -53,3 +53,28 @@ test('ffsubsync is matched with the dialogue lines only: captions, lyrics and si
   // Too few dialogue lines: every line is kept.
   assert.equal((dialogueVtt(`WEBVTT\n\n${lines.slice(0, 6).join('\n\n')}\n`).match(/-->/g) || []).length, 6);
 });
+
+test('a site track ASS gives only its spoken lines: opening, ending and sign styles and placed lines are left out', () => {
+  const { assDialogueVtt } = require('../electron/subtitle-sync.cjs');
+  const time = t => `0:${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}.00`;
+  const row = (i, style, text) => `Dialogue: 0,${time(10 + i * 2)},${time(11 + i * 2)},${style},,0,0,0,,${text}`;
+  const styles = ['Default', 'OP Romaji', 'ED English-furigana', 'Signs', 'Default-Alt', 'Default'];
+  const lines = Array.from({ length: 60 }, (_, i) => row(i, styles[i % 6], i % 6 === 5 ? '{\\pos(10,10)}Sign text' : `line ${i}`));
+  const out = assDialogueVtt(`[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${lines.join('\n')}\n`);
+  const kept = out.split('\n').filter(line => /^line /.test(line)).map(line => Number(line.slice(5)));
+  assert.ok(kept.length === 20 && kept.every(i => i % 6 === 0 || i % 6 === 4), kept.join(','));
+  // Fewer than 20 spoken lines: the VTT is used instead.
+  assert.equal(assDialogueVtt(`[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${lines.slice(0, 12).join('\n')}\n`), null);
+});
+
+test('segments: a line moves by the shift of the segment its start is in, its end with it', () => {
+  const { retimeVtt, retimeAss, segmentsOf, shiftAt } = require('../electron/subtitle-sync.cjs');
+  const segments = [{ from: 0, shift: -1 }, { from: 90, shift: 89.25 }];
+  assert.equal(shiftAt(segments, 89.9), -1); assert.equal(shiftAt(segments, 90), 89.25);
+  const vtt = 'WEBVTT\n\n00:00:10.000 --> 00:00:12.000\na\n\n00:01:58.500 --> 00:02:00.000\nb\n';
+  assert.equal(retimeVtt(vtt, 89.25, 1, segments), 'WEBVTT\n\n00:00:09.000 --> 00:00:11.000\na\n\n00:03:27.750 --> 00:03:29.250\nb\n');
+  assert.match(retimeAss('Dialogue: 0,0:01:58.50,0:02:00.00,Default,,0,0,0,,b', 0, 1, segments), /0:03:27\.75,0:03:29\.25/);
+  const before = 'WEBVTT\n\n00:00:10.000 --> 00:00:11.000\na\n\n00:00:20.000 --> 00:00:21.000\nb\n\n00:02:00.000 --> 00:02:01.000\nc\n';
+  const after = 'WEBVTT\n\n00:00:09.000 --> 00:00:10.000\na\n\n00:00:19.000 --> 00:00:20.000\nb\n\n00:03:29.250 --> 00:03:30.250\nc\n';
+  assert.deepEqual(segmentsOf(before, after), [{ from: 10, shift: -1 }, { from: 120, shift: 89.25 }]);
+});
