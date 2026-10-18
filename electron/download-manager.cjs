@@ -206,12 +206,15 @@ class DownloadManager {
   }
 
   // local: playlists already fetched by mirrorHls, which FFmpeg only remuxes (the last few percent of the progress).
+  // They are opened from their own folder by name (issue #12): FFmpeg finds a playlist's segments by its address, and
+  // takes a "#" in it ("#좀비를 찾습니다") for the start of a fragment, so it looked for every segment in the folder
+  // above and stopped at 95% with "Invalid data" (exit code 3199971767).
   runFfmpeg(job,stream,local=null) {
     return new Promise((resolve,reject)=>{
       let ffmpeg=require('ffmpeg-static');if(ffmpeg.includes('app.asar'))ffmpeg=ffmpeg.replace('app.asar','app.asar.unpacked');
-      const args=['-y'];
+      const args=['-y'],cwd=local?path.dirname(local.inputs[0]):undefined;
       if(local){
-        for(const input of local.inputs){args.push('-protocol_whitelist','file,crypto,data');if(input.endsWith('.m3u8'))args.push('-allowed_extensions','ALL');args.push('-i',input)}
+        for(const input of local.inputs){args.push('-protocol_whitelist','file,crypto,data');if(input.endsWith('.m3u8'))args.push('-allowed_extensions','ALL');args.push('-i',path.relative(cwd,input))}
         args.push('-map','0:v?','-map',local.inputs.length>1?'1:a?':'0:a?');
       }else{
         const headers={...(stream?.headers||{})};if(stream?.referer&&!headers.Referer)headers.Referer=stream.referer;
@@ -223,7 +226,7 @@ class DownloadManager {
       }
       args.push('-c','copy','-movflags','+faststart','-f','mp4',job.partialPath);
       const [from,span]=local?[95,4]:[0,99];
-      const child=spawn(ffmpeg,args,{windowsHide:true});this.active.get(job.id).process=child;let duration=0,stderr='';
+      const child=spawn(ffmpeg,args,{windowsHide:true,cwd});this.active.get(job.id).process=child;let duration=0,stderr='';
       child.stderr.on('data',chunk=>{const text=chunk.toString();stderr=(stderr+text).slice(-12000);const d=text.match(/Duration:\s*([^,]+)/)?.[1];if(d){duration=seconds(d);job.duration=duration}const t=[...text.matchAll(/time=\s*([^\s]+)/g)].pop()?.[1];if(t&&duration){const progress=from+Math.max(0,Math.min(span,Math.round(seconds(t)/duration*span)));if(progress!==job.progress){job.progress=progress;this.save();}}});
       child.once('error',reject);child.once('close',code=>{if(job.status==='paused')return resolve();if(code===0&&fs.existsSync(job.partialPath))resolve();else reject(new Error((stderr.match(/([^\r\n]+)$/)?.[1]||`FFmpeg 종료 코드 ${code}`).trim()));});
     });
