@@ -365,7 +365,8 @@ function showPendingPlayer(name,context={}){
 const videoServerKey=provider=>`${provider||'animenosub'}Server`;
 const KOREAN_SHOWS_KEY='koreanSubtitleShows';
 function koreanShows(){try{return JSON.parse(localStorage.getItem(KOREAN_SHOWS_KEY)||'[]')}catch{return []}}
-async function resolveWithVideoServer(episode,koreanSearch,anime,failedServers=[]){
+// resolve: how the stream is asked for (the next episode made ready ahead asks without touching the playing one's).
+async function resolveWithVideoServer(episode,koreanSearch,anime,failedServers=[],resolve=request=>window.lilac.providerResolve(request)){
   const picked=localStorage.getItem(videoServerKey(episode.provider))||'';let prefer='sub';
   const show=anime?.id?`${anime.provider||episode.provider}:${anime.id}`:'';
   koreanSearch.then(found=>{if(!found||!show)return;const list=koreanShows().filter(key=>key!==show);list.unshift(show);try{localStorage.setItem(KOREAN_SHOWS_KEY,JSON.stringify(list.slice(0,300)))}catch{}});
@@ -373,7 +374,7 @@ async function resolveWithVideoServer(episode,koreanSearch,anime,failedServers=[
     const saved=await window.lilac.savedSubtitles(episodeRef(episode)).catch(()=>[]);
     if(saved.some(entry=>entry.source!=='provider')||(show&&koreanShows().includes(show))||await Promise.race([koreanSearch,new Promise(resolve=>setTimeout(()=>resolve(null),8000))]))prefer='raw';
   }
-  return window.lilac.providerResolve({...episode,server:picked,prefer,failedServers});
+  return resolve({...episode,server:picked,prefer,failedServers});
 }
 async function resolveIntoPlayer(resolver,name,context={},subtitleTitle='',episode=1){
   const requestId=showPendingPlayer(name,context);
@@ -382,7 +383,11 @@ async function resolveIntoPlayer(resolver,name,context={},subtitleTitle='',episo
   try{
     // A download whose video is not there (moved, the drive unplugged) plays online instead.
     const job=context.episode?jobByRef(episodeRef(context.episode)):null,downloaded=job&&!job.missing?job:null;
-    const stream=downloaded?.status==='completed'?{...await window.lilac.playDownload(downloaded.id),downloaded:true}:['animenosub','miruro'].includes(context.episode?.provider)?await resolveWithVideoServer(context.episode,koreanSearch,context.anime,context.miruroFailedServers||[]):await resolver();
+    // A stream made ready ahead (다음 화 미리 준비 > 영상) is played when it still answers, else found again.
+    const ready=context.episode&&!context.miruroFailedServers?.length?preparedStreams.get(episodeRef(context.episode)):null;if(context.episode){preparedStreams.delete(episodeRef(context.episode));if(preparedNext===episodeRef(context.episode))preparedNext=null}
+    const prepared=ready&&!downloaded&&await window.lilac.streamAlive(ready.url,ready.headers||{}).catch(()=>false)?ready:null;if(requestId!==playbackRequestId)return;
+    if(prepared)await window.lilac.useEpisodeStream(context.episode,prepared);
+    const stream=downloaded?.status==='completed'?{...await window.lilac.playDownload(downloaded.id),downloaded:true}:prepared||(['animenosub','miruro'].includes(context.episode?.provider)?await resolveWithVideoServer(context.episode,koreanSearch,context.anime,context.miruroFailedServers||[]):await resolver());
     if(requestId!==playbackRequestId)return;
     const offlineEpisodes=downloaded?.status==='completed'?downloadedSeries(downloaded):[];
     play(stream.url,name,{...context,seriesEpisodes:offlineEpisodes.length?offlineEpisodes:context.seriesEpisodes,streamHeaders:stream.headers||{},offline:Boolean(downloaded?.status==='completed'),hls:Boolean(stream.hls)});
@@ -674,6 +679,8 @@ $('#autoSyncSubtitle').onclick=()=>runSubtitleSync();
 if(localStorage.getItem('subtitleSyncCheck')!=='false')window.lilac.prepareSubtitleSync?.().catch(()=>{});
 $('#subtitleSyncCheck').checked=localStorage.getItem('subtitleSyncCheck')!=='false';
 $('#subtitleSyncCheck').onchange=event=>localStorage.setItem('subtitleSyncCheck',String(event.target.checked));
+// 설정 > 재생 > 다음 화 미리 준비 (each on until turned off).
+for(const id of ['prepareNextVideo','prepareNextSubtitle','prepareNextTranslation']){$(`#${id}`).checked=localStorage.getItem(id)!=='false';$(`#${id}`).onchange=event=>localStorage.setItem(id,String(event.target.checked))}
 async function ensureSubtitle(stream,title,episode,{skipSaved=false}={}){
   const requestId=playbackRequestId,preferred=localStorage.getItem('subtitleSource')||'reanime',key=subtitleStoreKey();
   $('#subtitleOffer').classList.add('hidden');
@@ -911,9 +918,39 @@ async function applySavedJimaku(entry){
 }
 // Prepare the next episode using site Japanese, Jimaku, then site English. The main process
 // checks for Korean subtitles before translating. Manual translation remains available.
+// Only while 다음 화 미리 준비 > AI 번역 is on; with 자막과 싱크 on, the translation is synced too.
 function prepareNextEpisode(provider){
+  if(!playerFlag('prepareNextTranslation'))return;
   const next=typeof siblingEpisode==='function'?siblingEpisode(1):null,anime=subtitleSearchAnime();if(!next||!anime)return;
-  window.lilac.prepareEpisodeSubtitle({anime,episode:episodeNumberOf(next)||1,item:JSON.parse(JSON.stringify(next)),title:currentPlaybackContext.subtitleTitle||$('#skipTitle').value.trim(),provider,jimaku:seriesPick().jimaku||''}).catch(()=>{});
+  window.lilac.prepareEpisodeSubtitle({anime,episode:episodeNumberOf(next)||1,item:JSON.parse(JSON.stringify(next)),title:currentPlaybackContext.subtitleTitle||$('#skipTitle').value.trim(),provider,jimaku:seriesPick().jimaku||'',sync:playerFlag('prepareNextSubtitle')}).catch(()=>{});
+}
+// 다음 화 미리 준비 (설정 > 재생): while an episode plays, the next one is made ready in the background, each part as
+// 설정 says: its stream (영상: found now, used when the episode opens if it still answers), its Korean subtitle synced
+// to it (자막과 싱크: found and kept for the episode, synced by its site track), and its machine translation when it
+// has no Korean one (AI 번역). Once per next episode, as this one starts playing.
+const preparedStreams=new Map();let preparedNext='';
+async function prepareNext(){
+  const next=typeof siblingEpisode==='function'?siblingEpisode(1):null,context=currentPlaybackContext,requestId=playbackRequestId;
+  if(!next||preparedNext===episodeRef(next))return;
+  const ref=episodeRef(next),anime=subtitleSearchAnime(),title=context.subtitleTitle||$('#skipTitle').value.trim(),number=episodeNumberOf(next)||1,current=()=>requestId===playbackRequestId;
+  preparedNext=ref;
+  const downloaded=jobByRef(ref)?.status==='completed';
+  let stream=null;
+  if(playerFlag('prepareNextVideo')&&!downloaded){
+    try{
+      const koreanSearch=['ohli24','linkani'].includes(next.provider)?Promise.resolve(null):onlineSubtitleFor(title,number,anime).catch(()=>null);
+      stream=['animenosub','miruro'].includes(next.provider)?await resolveWithVideoServer(next,koreanSearch,context.anime,[],episode=>window.lilac.prepareEpisodeStream(episode))
+        :await window.lilac.prepareEpisodeStream(context.resolveKind==='linkkf'?{...next,resolveKind:'linkkf'}:next);
+      // Its first segments are fetched ahead from where it will start: its saved progress, as the player resumes it.
+      const saved=Number(state.history.find(x=>x.key===`${next.provider||context.resolveKind||'linkkf'}:${next.url||next.token||next.id||next.number}`)?.progress)||0;
+      if(stream?.url){preparedStreams.set(ref,stream);window.lilac.streamWarm(stream.url,saved>0&&saved<95?saved/100:0).catch(()=>{});}
+    }catch{stream=null}
+    if(!current())return;
+  }
+  if(downloaded||['ohli24','linkani'].includes(next.provider))return;
+  const found=playerFlag('prepareNextSubtitle')?await onlineSubtitleFor(title,number,anime).catch(()=>null):null;if(!current())return;
+  if(found&&stream?.subtitleTracks?.length)window.lilac.syncPreparedSubtitle({item:JSON.parse(JSON.stringify(next)),file:found.result.path,assPath:found.result.assPath||null,fonts:found.result.fonts||[],label:communityLabel(found.source,found.result),source:found.source,tracks:stream.subtitleTracks,referer:stream.referer||''}).catch(()=>{});
+  if(!found&&!context.siteKorean)prepareNextEpisode(seriesPick().provider||'');
 }
 function translateJimaku(provider='cloud',manual=false){const subtitle=currentPlaybackContext.jimakuSubtitle;if(subtitle)runTranslation({file:async()=>subtitle,name:'Jimaku',button:provider==='local'?$('#translateNowLocal'):$('#translateNow'),provider,manual})}
 // The one 번역 row translates the subtitle on screen: the picked Jimaku file, or the picked track.
@@ -1080,7 +1117,7 @@ $('#speed').onchange=e=>$('#video').playbackRate=Number(e.target.value);$('.dial
 $('#contentSource').onchange=e=>{localStorage.setItem('contentSource',e.target.value);syncSettingChoices();toast('콘텐츠 소스를 바꿨어요. 목록을 다시 불러옵니다.');setTimeout(()=>location.reload(),600)};$('#titleLanguage').onchange=e=>{localStorage.setItem('titleLanguage',e.target.value);syncSettingChoices();refreshTitleElements();toast(e.target.value==='en'?'작품 제목을 영어로 표시합니다.':'작품 제목을 한국어로 표시합니다.')};$('#themeSelect').onchange=e=>{localStorage.setItem('theme',e.target.value);applyTheme(e.target.value);syncSettingChoices()};$('#defaultSpeed').oninput=e=>{const value=SPEED_OPTIONS[Number(e.target.value)]||1;localStorage.setItem('defaultSpeed',String(value));$('#speed').value=String(value);$('#speedLabel').textContent=`${value.toFixed(2)}x`};
 ['defaultQuality','playerStart','subtitleSource'].forEach(id=>$(`#${id}`).onchange=e=>{localStorage.setItem(id,e.target.value);syncSettingChoices()});[['titleLanguageChoices','titleLanguage'],['themeChoices','themeSelect'],['sourceChoices','contentSource'],['qualityChoices','defaultQuality'],['playerStartChoices','playerStart'],['subtitleChoices','subtitleSource']].forEach(([group,select])=>$$(`#${group} button`).forEach(button=>button.onclick=()=>{const target=$(`#${select}`);target.value=button.dataset.value;target.dispatchEvent(new Event('change'))}));$('#subtitleSize').oninput=e=>{localStorage.setItem('subtitleSize',e.target.value);$('#subtitleSizeLabel').textContent=`${e.target.value}%`;applyCueStyle()};$('#subtitleSync').onchange=e=>{if(!setSubtitleSync(e.target.value))e.target.value=localStorage.getItem('subtitleSync')||'0'};$$('[data-sync]').forEach(button=>button.onclick=()=>{const current=Number(localStorage.getItem('subtitleSync')||0),delta=Number(button.dataset.sync);setSubtitleSync(delta===0?0:current+delta)});$('#vttBold').onchange=e=>{localStorage.setItem('vttBold',String(e.target.checked));applyCueStyle()};$('#vttOutline').oninput=e=>{localStorage.setItem('vttOutline',e.target.value);applyCueStyle();$('#outlineLabel').textContent=Number(e.target.value).toFixed(1)};$('#subtitlePosition').oninput=e=>{localStorage.setItem('subtitlePosition',e.target.value);applyVttLayout();$('#positionLabel').textContent=`${e.target.value}%`};$('#seekSeconds').onchange=e=>localStorage.setItem('seekSeconds',String(Math.max(1,Number(e.target.value)||10)));['clearOpEdAnalysis','clearOpEdFingerprint','clearOpEdAll'].forEach(id=>$(`#${id}`).onclick=async()=>{await window.lilac.clearOpEd();opEdAnalysisKey=null;skipSegments=[];toast('OP/ED 분석 데이터를 삭제했습니다.')});
 $('#video').addEventListener('timeupdate',e=>{applyPendingResume();const v=e.currentTarget,duration=playbackDuration();$('#playerSeek').value=duration?Math.round(v.currentTime/duration*1000):0;$('#playerTime').textContent=`${formatTime(v.currentTime)} / ${formatTime(duration)}`;activeSkip=skipSegments.find(x=>v.currentTime>=x.startTime&&v.currentTime<x.endTime)||null;activeSkipKey=activeSkip?`${activeSkip.type}:${activeSkip.startTime}:${activeSkip.endTime}`:null;updateSkipState(v);if(activeSkip){const type=activeSkip.type.toLowerCase();$('#skipNow span').textContent=type==='recap'?'요약 스킵':type.includes('ed')?'ED 스킵':'OP 스킵'}if(!duration||!currentHistoryKey)return;const item=state.history.find(x=>(x.key||x.src)===currentHistoryKey);if(!item)return;item.progress=Math.max(0,Math.min(100,Math.round(v.currentTime/duration*100)));item.updated=Date.now();if(Date.now()-(saveHistorySoon.last||0)>5000)saveHistorySoon();const card=$$('.continue-card').find(x=>x.dataset.historyKey===currentHistoryKey);if(card){card.querySelector('.history-progress i').style.width=`${item.progress}%`;card.querySelector(':scope > span').textContent=`EP.${item.episode?.number||1} · ${item.progress}%`}});
-$('#video').addEventListener('playing',()=>{$('#immersivePlayer').classList.add('is-playing');$('#playerEmpty').classList.add('hidden');showPlayerControls()});
+$('#video').addEventListener('playing',()=>{$('#immersivePlayer').classList.add('is-playing');$('#playerEmpty').classList.add('hidden');showPlayerControls();prepareNext().catch(()=>{})});
 // Progress is saved every few seconds while playing, and right away on pause and when leaving the player.
 function saveHistorySoon(){saveHistorySoon.last=Date.now();store.set('history',state.history)}
 $('#video').addEventListener('pause',()=>{saveHistorySoon();$('#immersivePlayer').classList.remove('is-playing');showPlayerControls()});

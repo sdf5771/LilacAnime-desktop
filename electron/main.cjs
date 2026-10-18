@@ -8,7 +8,7 @@ const { pipeline } = require('stream/promises');
 const AdmZip = require('adm-zip');
 const { spawn } = require('child_process');
 const { pathToFileURL } = require('url');
-const { createFlixProxyUrl, createFlixAvProxyUrl, closeFlixProxy } = require('./flix-proxy.cjs');
+const { createFlixProxyUrl, createFlixAvProxyUrl, closeFlixProxy, primeFlix } = require('./flix-proxy.cjs');
 const { createCatalogBrowser } = require('./catalog-browser.cjs');
 const { createWeeklySchedule } = require('./weekly-schedule.cjs');
 const { createProviderSchedule } = require('./provider-schedule.cjs');
@@ -418,6 +418,12 @@ function firstAnswering(items,attempt,stagger){
     };
     next();
   });
+}
+// A Linkkf episode's stream: the NR-HD player link from its API (the episode page when there is none).
+async function resolveLinkkfStream(episode) {
+  let playerUrl='';try{const root=await linkkfFetch(`https://emdlinkkf.5imgdarr.top/apilink2.php?data=${encodeURIComponent(episode.token)}`);const links=Array.isArray(root.data)?root.data:[];playerUrl=(links.find(x=>String(x.server).toUpperCase()==='NR-HD')||links[0]||{}).link||'';}catch{}
+  if(!playerUrl)playerUrl=`${LINKKF_WEB}/up/${encodeURIComponent(episode.postId)}/watch/?slug=${encodeURIComponent(episode.slug)}`;
+  return resolveStreamPage(playerUrl,`${LINKKF_WEB}/`,15000);
 }
 async function resolveProviderEpisode(episode) {
   if(episode.provider==='miruro')return resolveMiruroEpisode(episode);
@@ -2286,11 +2292,7 @@ app.whenReady().then(async () => {
     await player.loadURL(playerUrl, { httpReferrer: `${LINKKF_WEB}/` });
     return true;
   });
-  ipcMain.handle('linkkf:resolve', async (_, episode) => {
-    playerStreamHeaders=null;let playerUrl='';try{const root=await linkkfFetch(`https://emdlinkkf.5imgdarr.top/apilink2.php?data=${encodeURIComponent(episode.token)}`);const links=Array.isArray(root.data)?root.data:[];playerUrl=(links.find(x=>String(x.server).toUpperCase()==='NR-HD')||links[0]||{}).link||'';}catch{}
-    if(!playerUrl)playerUrl=`${LINKKF_WEB}/up/${encodeURIComponent(episode.postId)}/watch/?slug=${encodeURIComponent(episode.slug)}`;
-    return resolveStreamPage(playerUrl,`${LINKKF_WEB}/`,15000);
-  });
+  ipcMain.handle('linkkf:resolve', async (_, episode) => { playerStreamHeaders=null; return resolveLinkkfStream(episode); });
   // Home rails, most popular first and only shows that already have episodes (early in a season most are still to
   // air): "2026 가을 신작" (this season; Re:Anime and Miruro filter their catalog by season and year, Animenosub its
   // list by season tag) and "방영 중" (airing now). Seasons follow the anime calendar (January winter, April spring,
@@ -2413,6 +2415,38 @@ app.whenReady().then(async () => {
     if (['miruro', 'ohli24'].includes(episode?.provider)) playerStreamHeaders = stream.headers || null;
     return stream;
   });
+  // 다음 화 미리 준비: the next episode's stream found while this one plays. playerStreamHeaders (the headers the player's
+  // requests get) belong to the episode playing, so they are set only when the prepared stream is played (stream:use).
+  ipcMain.handle('provider:prepare', (_, episode) => episode?.resolveKind === 'linkkf' ? resolveLinkkfStream(episode) : resolveProviderEpisode(episode));
+  ipcMain.handle('stream:use', (_, episode, stream) => { playerStreamHeaders = ['miruro', 'ohli24'].includes(episode?.provider) ? stream?.headers || null : null; return true; });
+  // The first segments of a stream made ready ahead, fetched now and held by the local proxy until it plays (FlixCloud
+  // streams: the slow part of opening one, about 6 s, is its first segments). The playlists (video, and audio when it
+  // is apart) are read through the proxy, which also notes where each segment sits for its fetching ahead later.
+  // The proxy holds the playlists read here (x-lilac-hold) for the player too. `at` is where the episode will start (its
+  // saved progress, 0-1): the player loads the first segment, then the one there; the proxy's fetching ahead takes over
+  // after the two that follow it. The init segment (EXT-X-MAP) is held when the playlist has one.
+  ipcMain.handle('stream:warm', async (_, url, at = 0) => {
+    if (!/^http:\/\/127\.0\.0\.1:\d+\/__flix\//i.test(url || '')) return 0;
+    const read = async address => { const response = await fetch(address, { headers: { 'x-lilac-hold': '1' }, signal: AbortSignal.timeout(15000) }); return response.ok ? response.text() : ''; };
+    const entries = (text, base) => { const out = [], maps = []; let duration = 0; for (const line of String(text).split(/\r?\n/)) { const t = line.trim(); if (!t) continue; if (t.startsWith('#')) { const inf = t.match(/^#EXTINF:([\d.]+)/i), uri = t.match(/URI="([^"]+)"/i); if (inf) duration = Number(inf[1]) || 0; if (uri && /^#EXT-X-MEDIA/i.test(t)) out.push({ url: new URL(uri[1], base).href, duration: 0 }); if (uri && /^#EXT-X-MAP/i.test(t)) maps.push(new URL(uri[1], base).href); continue; } out.push({ url: new URL(t, base).href, duration }); duration = 0; } return { out, maps }; };
+    try {
+      const master = await read(url), lists = /#EXT-X-STREAM-INF|#EXT-X-MEDIA/i.test(master) ? entries(master, url).out.map(item => item.url) : [url];
+      const segments = [], start = Math.min(Math.max(Number(at) || 0, 0), 1);
+      for (const list of lists.slice(0, 2)) {
+        const { out: items, maps } = entries(list === url ? master : await read(list), list), total = items.reduce((sum, item) => sum + item.duration, 0);
+        let index = 0;
+        for (let time = 0; index < items.length - 1 && time + items[index].duration <= total * start; index++) time += items[index].duration;
+        segments.push(...maps, items[0]?.url, ...items.slice(index, index + 3).map(item => item.url));
+      }
+      return primeFlix(segments.filter(Boolean));
+    } catch { return 0; }
+  });
+  // Whether a stream found earlier still answers (its address may carry a token that runs out): its first bytes.
+  ipcMain.handle('stream:alive', async (_, url, headers = {}) => {
+    if (!/^https?:/i.test(url || '')) return false;
+    // A playlist the local proxy holds stays held for the player (x-lilac-hold); the proxy checks its token.
+    try { const response = await fetch(url, { headers: { ...(headers || {}), ...(/^http:\/\/127\.0\.0\.1:\d+\/__flix\//i.test(url) ? { 'x-lilac-hold': '1' } : {}), Range: 'bytes=0-1023' }, signal: AbortSignal.timeout(8000) }); response.body?.cancel?.(); return response.ok || response.status === 206; } catch { return false; }
+  });
   ipcMain.handle('provider:subtitle-tracks', (_, episode) => reanimeSubtitleTracks(episode));
   ipcMain.handle('cover:data', (_, url) => coverDataUrl(url));
   updater=new Updater({app,broadcast});
@@ -2527,7 +2561,27 @@ app.whenReady().then(async () => {
     if (item?.provider === 'miruro') { const stream = await resolveProviderEpisode(item); return { tracks: stream.subtitleTracks || [], referer: stream.referer || '' }; }
     return { tracks: [], referer: '' };
   }
-  ipcMain.handle('subtitle:prepare', (_, { anime = null, episode = 1, item = null, title = '', provider: asked = '', jimaku = '' } = {}) => {
+  // A subtitle made ready for another episode, synced with that episode's site tracks and kept for it ("<label> (<name>)
+  // · 자동 싱크"): what the episode puts on when it opens. Only by a site track (seconds, nothing downloaded) and after
+  // the player's own syncs (background), so the episode playing never waits behind it; without a track the episode
+  // is synced when it opens. Left as it is (and not kept) when the sync finds nothing better.
+  const syncPrepared=async({item,file,assPath=null,fonts=[],from=null,name='',label,source,tracks=[],referer=''})=>{
+    const usable=(tracks||[]).filter(track=>!/signs|songs|s&s|forced|dubtitle|\(ai\)|\bai\b|commentary/i.test(`${track.label||''} ${track.language||''}`))
+      .sort((a,b)=>Number(/full|dialog/i.test(`${b.label}`))-Number(/full|dialog/i.test(`${a.label}`))).slice(0,4);
+    const references=[];for(const track of usable){try{const saved=subtitleResult(await saveRemoteSubtitle(track.url,remoteTrackOptions(track.url,referer)));if(saved?.path)references.push({path:saved.path,assPath:saved.assPath||null})}catch{}}
+    if(!references.length||!file||!fs.existsSync(file))return null;
+    try{
+      const synced=await subtitleSync.sync({subtitlePath:file,assPath,timingPath:from,references,background:true});
+      if(synced.method!=='track')return null;
+      if(synced.unchanged||!synced.path)return null;
+      const key=encodeURIComponent(String(item?.url||item?.token||item?.id||item?.number||''));
+      return subtitleStore.save(key,{source,label:`${name?`${label} (${name})`:label} · 자동 싱크`,path:synced.path,assPath:synced.assPath||null,fonts:Array.isArray(fonts)?fonts:[],...(from?{from,fromName:name}:{})});
+    }catch{return null}
+  };
+  ipcMain.handle('subtitle:prepare-sync',(_,request={})=>syncPrepared(request||{}));
+  // sync: also sync the translation with the next episode's site track and keep it for that episode as "… · 자동 싱크",
+  // so the episode opens with it (다음 화 미리 준비 > 자막과 싱크).
+  ipcMain.handle('subtitle:prepare', (_, { anime = null, episode = 1, item = null, title = '', provider: asked = '', jimaku = '', sync = false } = {}) => {
     // Only while 설정 > 자막 자동 번역 is on, and by the side the next episode's own translation will use, or it would not
     // pick this one up: the side that translated this episode (asked: the player takes it for the series' next ones too),
     // the local AI when it is set up, the API when 번역 API로도 다음 화 미리 번역 is on. Without one asked, 설정's: the
@@ -2551,7 +2605,8 @@ app.whenReady().then(async () => {
         readTrack:async track=>subtitleResult(await saveRemoteSubtitle(track.url,remoteTrackOptions(track.url,referer)))
       });
       if(!picked)return;
-      await translator().translate({ file: picked.file.path, title: String(title || ''), provider, anySide: true, context: await translationContext(anime, String(title || '')) });
+      const result=await translator().translate({ file: picked.file.path, title: String(title || ''), provider, anySide: true, context: await translationContext(anime, String(title || '')) });
+      if(sync&&result?.path&&!result.failed)await syncPrepared({item,file:result.path,from:picked.file.path,name:picked.source==='jimaku'?'Jimaku':picked.value?.label||'자막',label:`${result.engine||'AI'} 번역`,source:'gemini',tracks,referer});
     }).catch(() => {});
     return true;
   });

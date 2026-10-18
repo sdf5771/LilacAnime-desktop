@@ -226,7 +226,7 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
   const venv = path.join(root, 'venv'), exe = path.join(venv, WIN ? 'Scripts' : 'bin', WIN ? 'ffsubsync.exe' : 'ffsubsync');
   const uvEnv = () => ({ ...process.env, UV_CACHE_DIR: path.join(root, 'cache'), UV_PYTHON_INSTALL_DIR: path.join(root, 'python'), UV_NO_PROGRESS: '1' });
   const children = new Set();
-  let installing = null, running = null;
+  let installing = null, running = null; const waiting = []; // [{resolve, background}]
 
   function installed() {
     try { return JSON.parse(fs.readFileSync(marker, 'utf8')).ffsubsync === FFSUBSYNC_VERSION && fs.existsSync(exe); } catch { return false; }
@@ -358,14 +358,16 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
   // Thresholds from 8 episodes against their site tracks: a right shift raised the score by 0.06 to 0.17 (to 0.89 and
   // over), a subtitle already right by under 0.003.
   const FIT = { track: { margin: 0.03, floor: 0.6 }, audio: { margin: 0.03, floor: 0.3 } };
-  async function sync({ videoUrl, headers = {}, subtitlePath, assPath = null, timingPath = null, references = [], referencePath = null, referenceAssPath = null, chapters = [], duration = 0, status = () => {} }) {
-    if (running) throw new Error('이미 자막 싱크를 맞추는 중입니다.');
+  async function sync({ videoUrl, headers = {}, subtitlePath, assPath = null, timingPath = null, references = [], referencePath = null, referenceAssPath = null, chapters = [], duration = 0, background = false, status = () => {} }) {
     if (!subtitlePath || !fs.existsSync(subtitlePath)) throw new Error('자막 파일이 없습니다.');
     const tracks = [...(references || []), ...(referencePath ? [{ path: referencePath, assPath: referenceAssPath }] : [])].filter(track => track?.path && fs.existsSync(track.path));
     // The track with the most spoken lines (by content: a "S&S" track has none).
     const best = tracks.map(track => ({ track, vtt: spokenVtt(track.path, track.assPath) })).map(item => ({ ...item, lines: vttCues(item.vtt).length })).sort((a, b) => b.lines - a.lines)[0];
     const byTrack = Boolean(best && best.lines >= 20);
     if (!byTrack && !/^(https?|file):/i.test(videoUrl || '')) throw new Error('이 영상은 자동 싱크를 쓸 수 없습니다.');
+    // One at a time: a later one waits for the one running, and the player's go before the ones made ready ahead for
+    // the next episode (background).
+    while (running) await new Promise(resolve => waiting.push({ resolve, background }));
     const abort = new AbortController(), work = fs.mkdtempSync(path.join(os.tmpdir(), 'lilac-sync-'));
     running = abort;
     const stopped = () => { if (abort.signal.aborted) throw Object.assign(new Error('취소했습니다.'), { canceled: true }); };
@@ -439,6 +441,8 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
       return { ...result, ...retime({ subtitlePath, assPath, ...result }) };
     } finally {
       running = null;
+      const next = waiting.findIndex(item => !item.background);
+      (next >= 0 ? waiting.splice(next, 1)[0] : waiting.shift())?.resolve();
       fs.rmSync(work, { recursive: true, force: true });
     }
   }

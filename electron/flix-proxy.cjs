@@ -55,13 +55,23 @@ async function fetchRanges(target,headers){
   await Promise.all(Array.from({length:Math.min(PARTS,ranges.length)},async()=>{while(next<ranges.length){const i=next++;parts[i]=(await fetchHedged(target,headers,...ranges[i])).body}}));
   return {upstream:first,raw:Buffer.concat([head,...parts])};
 }
-// A segment already on the way (fetched ahead, or asked for twice by player and download) is not fetched again.
-async function fetchSegment(target,headers){let job=ahead.get(target);if(!job){job=fetchRanges(target,headers);job.catch(()=>{});ahead.set(target,job)}try{return await job}finally{ahead.delete(target)}}
+// A segment already on the way (fetched ahead, or asked for twice by player and download, or held for the next
+// episode) is not fetched again.
+async function fetchSegment(target,headers){let job=ahead.get(target)||primed.get(target);if(!job){job=fetchRanges(target,headers);job.catch(()=>{});ahead.set(target,job)}try{return await job}finally{ahead.delete(target);primed.delete(target)}}
+// 다음 화 미리 준비: the first segments of the next episode, fetched while this one plays and held until it plays (apart
+// from KEEP, which the playing episode's fetching ahead fills and turns over). One next episode at a time.
+const primed=new Map();
+// Its playlists too: read once ahead with x-lilac-hold (kept, as for a check that the stream still answers), then
+// handed to the player's first ask. A held playlist is used only while its address's token (6 h on FlixCloud) lasts.
+const heldLists=new Map();
+function tokenLive(target){try{const token=new URL(target).searchParams.get('token');if(!token)return true;const exp=JSON.parse(Buffer.from(token.split('.')[1],'base64url').toString()).exp;return !exp||exp*1000>Date.now()}catch{return true}}
+function requestHeaders(data){const headers={};for(const [k,v] of Object.entries(data?.headers||{}))if(['user-agent','referer','origin','cookie','accept','accept-language'].includes(k.toLowerCase())&&v)headers[k]=v;return headers}
+function primeFlix(urls=[]){primed.clear();const kept=new Set();for(const url of urls){let parts;try{parts=new URL(url).pathname.split('/').filter(Boolean)}catch{continue}const data=sessions.get(parts[1]);if(parts[0]!=='__flix'||parts.length<3||!data)continue;kept.add(parts[1]);const target=Buffer.from(parts.slice(2).join('/'),'base64url').toString();if(primed.has(target)||kind(target)!=='segment')continue;const job=fetchRanges(target,requestHeaders(data));job.catch(()=>{});primed.set(target,job)}for(const [target,held] of heldLists)if(!kept.has(held.session))heldLists.delete(target);return primed.size}
 // While one segment plays, the next ones are already on the way.
 function fetchAhead(data,target,headers){const place=data.order.get(target);if(!place)return;
   for(const url of place.list.slice(place.index+1,place.index+1+AHEAD)){if(ahead.has(url))continue;const job=fetchRanges(url,headers);job.catch(()=>{});ahead.set(url,job)}
   while(ahead.size>KEEP)ahead.delete(ahead.keys().next().value)}
-async function handle(req,res){try{const parts=new URL(req.url,'http://127.0.0.1').pathname.split('/').filter(Boolean);if(parts.length<3||parts[0]!=='__flix'){res.writeHead(404).end();return}const data=sessions.get(parts[1]);if(!data){res.writeHead(410).end();return}if(parts[2]==='master.m3u8'&&data.videoUrl&&data.audioUrl){const port=server.address().port,video=proxyUrl(port,parts[1],data.videoUrl),audio=proxyUrl(port,parts[1],data.audioUrl);const body=Buffer.from(`#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,URI="${audio}"\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,AUDIO="audio"\n${video}\n`);res.writeHead(200,{'content-type':'application/vnd.apple.mpegurl','content-length':body.length,'access-control-allow-origin':'*','cache-control':'no-store'});res.end(body);return}const target=Buffer.from(parts.slice(2).join('/'),'base64url').toString();const headers={};for(const [k,v]of Object.entries(data.headers||{}))if(['user-agent','referer','origin','cookie','accept','accept-language'].includes(k.toLowerCase())&&v)headers[k]=v;const type=kind(target);let upstream,raw,body;
+async function handle(req,res){try{const parts=new URL(req.url,'http://127.0.0.1').pathname.split('/').filter(Boolean);if(parts.length<3||parts[0]!=='__flix'){res.writeHead(404).end();return}const data=sessions.get(parts[1]);if(!data){res.writeHead(410).end();return}if(parts[2]==='master.m3u8'&&data.videoUrl&&data.audioUrl){const port=server.address().port,video=proxyUrl(port,parts[1],data.videoUrl),audio=proxyUrl(port,parts[1],data.audioUrl);const body=Buffer.from(`#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,URI="${audio}"\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,AUDIO="audio"\n${video}\n`);res.writeHead(200,{'content-type':'application/vnd.apple.mpegurl','content-length':body.length,'access-control-allow-origin':'*','cache-control':'no-store'});res.end(body);return}const target=Buffer.from(parts.slice(2).join('/'),'base64url').toString();const headers=requestHeaders(data);const type=kind(target);let upstream,raw,body;
   // The player asks for one video and one audio segment at a time; more at once is a download, which asks for the
   // following segments itself.
   if(type==='segment'){data.active=(data.active||0)+1;res.on('close',()=>data.active--);if(data.active<=2)fetchAhead(data,target,headers)}
@@ -69,7 +79,7 @@ async function handle(req,res){try{const parts=new URL(req.url,'http://127.0.0.1
   // so refetch twice and otherwise fail the request (hls.js retries loads, but a parse error is fatal).
   for(let attempt=0;attempt<3;attempt++){
     if(type==='segment')({upstream,raw}=await (attempt?fetchRanges(target,headers):fetchSegment(target,headers)));
-    else{upstream=await fetch(target,{headers});raw=Buffer.from(await upstream.arrayBuffer())}
+    else{const hold=Boolean(req.headers['x-lilac-hold']),held=!attempt&&type==='m3u8'?heldLists.get(target):null;if(held&&tokenLive(target))({upstream,raw}=held);else{upstream=await fetch(target,{headers});raw=Buffer.from(await upstream.arrayBuffer())}if(type==='m3u8'){if(hold&&upstream.ok)heldLists.set(target,{session:parts[1],upstream,raw});else heldLists.delete(target)}}
     if(!upstream.ok){res.writeHead(upstream.status,{'content-type':upstream.headers.get('content-type')||'text/plain'});res.end(raw);return}
     if(type==='m3u8'){body=decodeManifest(raw,data.pk,target,parts[1],server.address().port);break}
     body=decodeSegment(raw);if(isMedia(body))break;
@@ -81,6 +91,6 @@ async function handle(req,res){try{const parts=new URL(req.url,'http://127.0.0.1
 async function ensureServer(){if(server?.listening)return;server=http.createServer(handle);await new Promise((resolve,reject)=>server.once('error',reject).listen(0,'127.0.0.1',resolve))}
 async function createFlixProxyUrl(url,pk,headers={}){await ensureServer();const id=crypto.randomUUID().replaceAll('-','');sessions.set(id,{pk,headers,order:new Map()});return proxyUrl(server.address().port,id,url)}
 async function createFlixAvProxyUrl(videoUrl,audioUrl,pk,headers={}){await ensureServer();const id=crypto.randomUUID().replaceAll('-','');sessions.set(id,{pk,headers,videoUrl,audioUrl,order:new Map()});return `http://127.0.0.1:${server.address().port}/__flix/${id}/master.m3u8`}
-function closeFlixProxy(){sessions.clear();ahead.clear();server?.close();server=null}
+function closeFlixProxy(){sessions.clear();ahead.clear();primed.clear();heldLists.clear();server?.close();server=null}
 
-module.exports={createFlixProxyUrl,createFlixAvProxyUrl,closeFlixProxy,fetchHedged};
+module.exports={createFlixProxyUrl,createFlixAvProxyUrl,closeFlixProxy,fetchHedged,primeFlix};
