@@ -630,7 +630,10 @@ function checkSubtitleSync(subtitle){
     runSubtitleSync(true);
   },6000);
 }
-$('#autoSyncSubtitle').onclick=runSubtitleSync;
+$('#autoSyncSubtitle').onclick=()=>runSubtitleSync();
+// ffsubsync is installed in the background half a minute after start (after the start's own downloads), while 자동으로
+// 맞추기 is on, so the first sync does not wait for it.
+setTimeout(()=>{if(localStorage.getItem('subtitleSyncCheck')!=='false')window.lilac.prepareSubtitleSync?.().catch(()=>{})},30000);
 $('#subtitleSyncCheck').checked=localStorage.getItem('subtitleSyncCheck')!=='false';
 $('#subtitleSyncCheck').onchange=event=>localStorage.setItem('subtitleSyncCheck',String(event.target.checked));
 async function ensureSubtitle(stream,title,episode,{skipSaved=false}={}){

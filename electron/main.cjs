@@ -2434,6 +2434,9 @@ app.whenReady().then(async () => {
     const status=(message,progress=null)=>{if(!event.sender.isDestroyed())event.sender.send('subtitle-sync:status',{message,progress})};
     try{return await subtitleSync.sync({...request,status})}catch(error){if(error.canceled)return {canceled:true};throw error}
   });
+  // Installed in the background a little after start (the player asks while 자동으로 맞추기 is on), so the first sync
+  // does not wait for it; a failed try is made again at the next start, or by the first sync.
+  ipcMain.handle('subtitle-sync:prepare',()=>{if(!subtitleSync.installed())subtitleSync.install().catch(()=>{});return true});
   ipcMain.handle('subtitle-sync:retime',(_,request={})=>subtitleSync.retime({subtitlePath:String(request.subtitlePath||''),assPath:request.assPath?String(request.assPath):null,offset:Number(request.offset),scale:Number(request.scale)||1}));
   ipcMain.handle('subtitle-sync:cancel',()=>{syncCheck?.abort();subtitleSync.cancel();return true});
   // 설정 > 자막 캐시: the subtitle files no saved subtitle uses (translations, downloads, partial results), removed by
