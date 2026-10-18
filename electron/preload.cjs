@@ -86,6 +86,7 @@ contextBridge.exposeInMainWorld('lilac', {
   setTmdbKey: key => ipcRenderer.invoke('tmdb:set', key),
   geminiSettings: () => ipcRenderer.invoke('gemini:get'),
   setGeminiSettings: value => ipcRenderer.invoke('gemini:set', value),
+  defaultTranslationRules: () => ipcRenderer.invoke('translation:default-rules'),
   translateSubtitle: options => ipcRenderer.invoke('subtitle:translate', options),
   jimakuList: (anime, episode, preferred = '') => ipcRenderer.invoke('jimaku:list', anime, episode, preferred),
   jimakuDownload: (file, anime, episode) => ipcRenderer.invoke('jimaku:download', file, anime, episode),

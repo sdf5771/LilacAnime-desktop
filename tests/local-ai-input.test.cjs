@@ -75,3 +75,17 @@ test('input options change translation cache identity and reject invalid setting
   assert.throws(() => ai.setModelOptions(id, { inputMode: 'invalid', sourceLanguage: 'ja' }));
   assert.throws(() => ai.setModelOptions(id, { inputMode: 'chat', sourceLanguage: 'ja', customPrompt: 'No source placeholder' }));
 });
+test('번역 프롬프트 reaches the models that follow instructions, and not a language template', async t => {
+  const rules = { custom: 'CUSTOM RULES', extra: 'EXTRA RULE' };
+  const gemma = setup(t, { template: '<|turn>' });
+  await gemma.ai.translateLines(['こんにちは'], { modelId: gemma.id, rules });
+  const system = gemma.calls[0].body.messages[0].content;
+  assert.match(system, /^CUSTOM RULES\nAdditional rules from the user[^\n]*\nEXTRA RULE\nAnswer with the Korean line only/);
+  assert.doesNotMatch(system, /You translate Japanese anime subtitles/);
+  const chat = setup(t, { template: '{{ messages }}' });
+  await chat.ai.translateLines(['こんにちは'], { modelId: chat.id, rules });
+  assert.match(chat.calls[0].body.messages[0].content, /^CUSTOM RULES\nAdditional rules from the user[^\n]*\nEXTRA RULE\n\nこんにちは$/);
+  const language = setup(t);
+  await language.ai.translateLines(['こんにちは'], { modelId: language.id, rules });
+  assert.deepEqual(language.calls[0].body.messages, [{ role: 'user', content: 'こんにちは' }]);
+});

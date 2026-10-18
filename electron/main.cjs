@@ -1920,6 +1920,8 @@ async function translationContext(anime={},title=''){
 const ANISSIA_API='https://api.anissia.net';
 // Online subtitle sources in their default search order.
 const COMMUNITY_SOURCES=['kairan','csora','anissia'];
+// The saved subtitle sources a download counts as Korean (as download-manager's KOREAN_SOURCES).
+const DOWNLOAD_KOREAN_SOURCES=[...COMMUNITY_SOURCES,'gemini','linkkf','user'];
 function communitySubtitleLabel(source,result={}){return source==='anissia'?`Anissia${result.maker?` · ${result.maker}`:''} 자막`:`${source==='kairan'?'Kairan':'Csora'} 자막`}
 const anissiaResponseCache=new Map(),anissiaRequests=new Map();
 async function anissiaFetch(pathname){
@@ -2127,15 +2129,19 @@ app.whenReady().then(async () => {
   const findDownloadSubtitle=async(job,stream)=>{
     const key=downloadSubtitleKey(job),saved=key?subtitleStore.list(key):[],preferred=job.subtitleSource||'reanime';
     const fromSaved=entry=>({source:entry.source,path:entry.path,assPath:entry.assPath,fonts:entry.fonts||[],label:entry.label});
-    // A machine translation stands for the Re:Anime subtitle it was made from when it was the last one put on.
-    const savedPreferred=(preferred==='reanime'&&saved[0]?.source==='gemini'&&saved[0])||saved.find(entry=>entry.source===preferred);if(savedPreferred)return fromSaved(savedPreferred);
+    // A Korean subtitle comes first: one saved for the episode (the preferred source's, a machine translation standing
+    // for the Re:Anime subtitle it was made from when it was the last one put on), the site's Korean track, then
+    // Kairan / Csora / Anissia. A saved subtitle in another language (a site's English track, Jimaku) is used only when
+    // none of them has one, so a Korean fansub keeps the episode from being translated (track and Jimaku translation).
+    const korean=entry=>DOWNLOAD_KOREAN_SOURCES.includes(entry?.source);
+    const savedPreferred=(preferred==='reanime'&&saved[0]?.source==='gemini'&&saved[0])||saved.find(entry=>entry.source===preferred);if(korean(savedPreferred))return fromSaved(savedPreferred);
     if(stream?.subtitleUrl)return {stream:true};
-    if(saved[0])return fromSaved(saved[0]);
+    const savedKorean=saved.find(korean);if(savedKorean)return fromSaved(savedKorean);
     const search=communitySearch(job);
     for(const source of COMMUNITY_SOURCES.includes(preferred)?[preferred,...COMMUNITY_SOURCES.filter(x=>x!==preferred)]:COMMUNITY_SOURCES){
       try{return await search(source)}catch{/* next source */}
     }
-    return null;
+    const other=savedPreferred||saved[0];return other?fromSaved(other):null;
   };
   // One online source's Korean subtitle for a download (the Korean titles are looked up once per download).
   const communitySearch=job=>{
@@ -2609,6 +2615,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('localai:model-options', (_, id, options) => { translator().local.setModelOptions(String(id || ''), options); return translator().settings(); });
   ipcMain.handle('localai:remove',(_,id)=>{translator().local.removeModel(String(id||''));return translator().settings()});
   ipcMain.handle('gemini:set',(_,value={})=>translator().saveSettings(value||{}));
+  ipcMain.handle('translation:default-rules',()=>translator().defaultRules());
   // The player's run leaves (its episode changed, or its button was pressed again); downloads keep theirs.
   ipcMain.handle('subtitle:cancel',(_,id)=>{translator().cancel(Number(id)||null);return true});
   // The player jumped while its subtitle is translated: the lines from there are translated next.

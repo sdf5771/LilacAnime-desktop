@@ -78,7 +78,8 @@ function syncPlayerSettingsUI() {
   $('#psSpeedLabel').textContent = `${speed.toFixed(2)}x`;
   $$('#psSpeeds button').forEach(button => button.classList.toggle('selected', Number(button.dataset.speed) === speed));
   const seconds = Number(localStorage.getItem('seekSeconds') || 10);
-  $('#psSeekNote').textContent = `뒤로/앞으로 버튼 이동: ${seconds}초`;
+  $('#psSeekLabel').textContent = `${seconds}초`; $('#psSeekSeconds').value = String(seconds);
+  $$('#psSeekSteps button').forEach(button => button.classList.toggle('selected', Number(button.dataset.seek) === seconds));
   renderQualityChoices();
   renderVideoServers();
   renderDiscoveredFonts();
@@ -818,6 +819,15 @@ $('#closePlayerSettings').onclick = () => { openPlayerSettings(false); $('#playe
 $('#psAutoPlay').onchange = event => localStorage.setItem('playerAutoPlay', String(event.target.checked));
 $('#psSkipButton').onchange = event => { localStorage.setItem('playerSkipButton', String(event.target.checked)); updateSkipState($('#video')); };
 $('#psAutoSkip').onchange = event => localStorage.setItem('playerAutoSkip', String(event.target.checked));
+// 뒤로/앞으로 이동: the same setting as 설정 > 재생 (1–120 seconds), kept in step with that page.
+function setSeekSeconds(value) {
+  const seconds = Math.min(120, Math.max(1, Math.round(Number(value)) || 10));
+  localStorage.setItem('seekSeconds', String(seconds));
+  if ($('#seekSeconds')) $('#seekSeconds').value = String(seconds);
+  syncPlayerSettingsUI();
+}
+$$('#psSeekSteps button').forEach(button => button.onclick = () => setSeekSeconds(button.dataset.seek));
+$('#psSeekSeconds').onchange = event => setSeekSeconds(event.target.value);
 $$('#psSubtitleSources button').forEach(button => button.onclick = () => selectSubtitleSource(button.dataset.source));
 $('#psSubtitleSync').onchange = event => { setSubtitleSync(event.target.value); syncPlayerSettingsUI(); };
 $('#psSubtitleSize').oninput = event => { setSubtitleSetting('subtitleSize', event.target.value); applyCueStyle(); };

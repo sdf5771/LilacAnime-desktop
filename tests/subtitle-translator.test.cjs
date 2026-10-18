@@ -17,8 +17,8 @@ function setup(t, fetch, settings = {}) {
   const sandbox = { module, exports: module.exports, fetch, AbortSignal, AbortController, setTimeout, clearTimeout,
     Buffer, console, require: name => name === './local-ai.cjs' ? { createLocalAi: () => ({ models: () => [] }), promptVersion: () => '' } : requireReal(name) };
   // Exercise the real request/retry functions without adding a production test API.
-  vm.runInNewContext(source.replace('return { settings, saveSettings, translate, cancel, jump, ready, local, clouds: CLOUDS };',
-    'return { settings, saveSettings, translate, cancel, generate, askOpenai, askQwen, askDeepl };'), sandbox, { filename });
+  vm.runInNewContext(source.replace('return { settings, saveSettings, translate, cancel, jump, ready, local, clouds: CLOUDS, defaultRules: () => TRANSLATION_RULES };',
+    'return { settings, saveSettings, translate, cancel, generate, askOpenai, askQwen, askDeepl, system, defaultRules: () => TRANSLATION_RULES };'), sandbox, { filename });
   return { ai: module.exports.createTranslator(dir), dir };
 }
 
@@ -186,4 +186,36 @@ test('효과음·화자 이름 빼고 번역: labels and speaker names never rea
   const out = fs.readFileSync(result.path, 'utf8');
   assert.match(out, /00:00:01.000 --> 00:00:02.000\n어\?/);
   assert.doesNotMatch(out, /00:00:03|00:00:05|ため息|はあ/);
+});
+
+test('번역 프롬프트: the user rules replace or follow the app rules, and the answer format always stays', async t => {
+  const { ai } = setup(t, async () => response({}));
+  const plain = ai.system({ title: '작품' }, true);
+  assert.match(plain, /TRANSLATION\n- Read the lines as a scene/);
+  assert.doesNotMatch(plain, /ADDITIONAL RULES/);
+  const custom = ai.system({ title: '작품', rules: { custom: '- 의역 우선', extra: '- 욕설 유지' } }, true);
+  assert.match(custom, /Anime: 작품/);
+  assert.match(custom, /FORMAT\n- Input: a JSON object/);
+  assert.match(custom, /TRANSLATION\n- 의역 우선\n\nADDITIONAL RULES FROM THE USER[^\n]*\n- 욕설 유지$/);
+  assert.doesNotMatch(custom, /Read the lines as a scene/);
+  assert.equal(ai.defaultRules().split('\n')[0], '- Read the lines as a scene: work out from the flow who is speaking to whom, and translate each line for that speaker and listener.');
+});
+
+test('번역 프롬프트 is saved trimmed, refused past 4000 characters, and a new prompt is translated again (DeepL is not)', async t => {
+  let calls = 0, instructions = '';
+  const { ai, dir } = setup(t, async (url, init) => {
+    calls++; instructions = JSON.parse(init.body).instructions || '';
+    return response({ output: [{ content: [{ type: 'output_text', text: '{"lines":[{"i":0,"t":"안녕"}]}' }] }] });
+  }, { cloud: 'openai', openaiKey: 'fake-key', openaiModel: 'gpt-5-mini' });
+  await ai.saveSettings({ promptExtra: '  - 반말 유지  ' });
+  assert.equal(ai.settings().promptExtra, '- 반말 유지');
+  await assert.rejects(ai.saveSettings({ promptRules: 'x'.repeat(4001) }), /4000자/);
+  const file = path.join(dir, 'source.vtt');
+  fs.writeFileSync(file, 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n');
+  await ai.translate({ file, provider: 'cloud' });
+  assert.match(instructions, /ADDITIONAL RULES FROM THE USER[^\n]*\n- 반말 유지/);
+  assert.equal((await ai.translate({ file, provider: 'cloud' })).cached, true);
+  await ai.saveSettings({ promptExtra: '- 존댓말' });
+  assert.equal((await ai.translate({ file, provider: 'cloud' })).cached, false);
+  assert.equal(calls, 2);
 });

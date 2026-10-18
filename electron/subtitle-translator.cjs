@@ -21,7 +21,23 @@ const PROMPT_VERSION = 'prompt-3', LOCAL_PROMPT_VERSION = 'local-4';
 // - A speaker before a colon at the start: 創太： SOTA: (an English one in capitals only, so "Note: …" stays).
 // - A line of vocal sounds alone: あっ, うう…, くっ, はあ, あはは, ふふっ, Ugh!, Hahaha (not うん, ええ, ううん: those are words).
 // A cue left with nothing is not translated and is left out of the translated file.
-const SOUND_WORD = /(?:音|声|息|笑い|笑|泣き|悲鳴|咳|咳払い|拍手|歓声|鼻歌|舌打ち|いびき|あくび|くしゃみ|うめき|叫び|ノック|チャイム|ベル|着信|振動|鳴る|鳴く|音楽|BGM)$/;
+// How the APIs are told to translate (the TRANSLATION part of their system prompt). 번역 프롬프트 > 기본 규칙 불러오기
+// shows it, as the place to start a set of rules of one's own.
+const TRANSLATION_RULES = [
+  '- Read the lines as a scene: work out from the flow who is speaking to whom, and translate each line for that speaker and listener.',
+  '- Translate the meaning faithfully. Do not add, explain, soften or censor anything, and do not invent what is not said.',
+  '- Write natural spoken Korean, as short as a subtitle should be. Avoid translationese (needless 그녀/그, 당신, ~하는 것이다, literal idioms).',
+  '- Choose 반말 or 존댓말 from the relationship (friends, family, classmates: 반말; strangers, superiors, polite characters: 존댓말) and keep each character\'s voice the same throughout: rough or gentle, old-fashioned or childish speech, verbal tics and catchphrases.',
+  '- Words for people follow the speaker: お兄ちゃん / 兄さん → 오빠 from a girl, 형 from a boy; お姉ちゃん / 姉さん → 언니 from a girl, 누나 from a boy; 先輩 → 선배, 先生 → 선생님.',
+  '- Other Japanese names in Hangul by the usual Korean fan spelling (e.g. 마히루, 아마네, 츠카사, 쇼타; つ is 츠, not 쓰). Keep the original name order.',
+  '- Honorifics: -san → 씨 or nothing, -kun / -chan → nothing (or 군 / 짱 where it matters), -sama → 님.',
+  '- Set phrases as Koreans say them: いただきます → 잘 먹겠습니다, ごちそうさま → 잘 먹었습니다, ただいま → 다녀왔어, おかえり → 어서 와, いってきます → 다녀올게, お疲れ様 → 수고했어, よろしく → 잘 부탁해.',
+  '- Stammers and cut-off words stay stammers (べ、別に → 벼, 별로); interjections become Korean ones (えっ → 어?, はぁ? → 하아?, よし → 좋아, まあ → 뭐).',
+  '- Jokes and wordplay: keep the effect in Korean rather than the literal words. Song lyrics: translate as lyrics. Attack and spell names: as the fandom would say them, usually translated.',
+  '- Lines that are only sounds, music marks or symbols stay as they are. Keep caption labels in their brackets, translated: (男の子) → (남자아이), [ため息] → [한숨].',
+  '- Keep a line break (\\n) where the original has one if it still reads well.'
+].join('\n');
+const SOUND_WORD =/(?:音|声|息|笑い|笑|泣き|悲鳴|咳|咳払い|拍手|歓声|鼻歌|舌打ち|いびき|あくび|くしゃみ|うめき|叫び|ノック|チャイム|ベル|着信|振動|鳴る|鳴く|音楽|BGM)$/;
 const VOCAL = /^(?:[あぁアァ]+|[うぅウゥ]+|[くク]+|[ぐグ]+|[んン]+|[ひヒ]+|[へヘ]+|[ほホ]+|[ふフ]+|[はハ][あぁアァ]*|(?:[あぁアァ]?[はハ])+|(?:[うぅウゥ]?[ふフ])+|(?:[えぇエェ]?[へヘ])+|(?:[いぃイィ]?[ひヒ])+|a+h*|o+h+|u+g*h+|h+m+|m+|(?:h[aeio]){2,}|gr+|a+r+g+h+|o+w+)$/i;
 function captionLabel(inside) {
   const value = inside.trim();
@@ -82,6 +98,9 @@ function createTranslator(userData) {
       // 효과음·화자 이름 빼고 번역: caption labels, sound-only lines and speaker names are taken out before any engine sees
       // the lines (see dropCaptions).
       dropCaptions: value.dropCaptions === true,
+      // 번역 프롬프트: promptExtra, the user's rules added after the app's; promptRules, the user's rules in place of the
+      // app's (the work, names, glossary, lines before and answer format are still given). See promptRules().
+      promptExtra: text('promptExtra'), promptRules: text('promptRules'),
       // How a picked Jimaku file is translated by itself: 'off', 'cloud' or 'local' ('gemini' before the other APIs came;
       // older settings still: on = whichever is set up).
       jimakuTranslate: value.jimakuTranslate === 'gemini' ? 'cloud' : ['off', 'cloud', 'local'].includes(value.jimakuTranslate) ? value.jimakuTranslate : value.autoJimaku === false ? 'off' : 'cloud' };
@@ -171,6 +190,11 @@ function createTranslator(userData) {
     if ('jimakuTranslate' in change && ['off', 'cloud', 'local'].includes(change.jimakuTranslate)) next.jimakuTranslate = change.jimakuTranslate;
     if ('prepareNextCloud' in change) next.prepareNextCloud = change.prepareNextCloud === true;
     if ('dropCaptions' in change) next.dropCaptions = change.dropCaptions === true;
+    for (const name of ['promptExtra', 'promptRules']) if (name in change) {
+      const value = String(change[name] || '').trim();
+      if (value.length > 4000) throw new Error('번역 프롬프트는 4000자까지 쓸 수 있습니다.');
+      next[name] = value;
+    }
     if ('cloud' in change && Object.hasOwn(CLOUDS, change.cloud)) next.cloud = change.cloud;
     if ('qwenRegion' in change && ['international', 'china'].includes(change.qwenRegion)) next.qwenRegion = change.qwenRegion;
     if ('openaiModel' in change && next.openaiModels.includes(change.openaiModel)) next.openaiModel = change.openaiModel;
@@ -272,7 +296,10 @@ function createTranslator(userData) {
   // Written like a Korean fansub team's style guide: the work, what the answer must look like, then how to translate.
   // context: {title (as shown in the app, usually Korean), originalTitle, genres, synopsis, characters: [{name, native,
   // first, last, gender}] from AniList}. Names come with a Korean spelling (anime-glossary) so every batch agrees.
+  // context.rules: the user's {extra, custom} rules (번역 프롬프트): custom takes the place of TRANSLATION_RULES, extra comes
+  // after them and is followed first.
   const system = (context = {}, wrapped = false) => {
+    const rules = context.rules || {};
     const characters = (context.characters || []).filter(item => item.name || item.native).slice(0, 30);
     const korean = new Map(characterTerms(characters).map(term => [term.ja, term.ko]));
     const gender = item => item.gender === 'Female' ? 'female' : item.gender === 'Male' ? 'male' : '';
@@ -290,18 +317,8 @@ function createTranslator(userData) {
       '- A sentence can run over several lines: translate it so the lines read naturally one after another, but keep each part on its own line.',
       '',
       'TRANSLATION',
-      '- Read the lines as a scene: work out from the flow who is speaking to whom, and translate each line for that speaker and listener.',
-      '- Translate the meaning faithfully. Do not add, explain, soften or censor anything, and do not invent what is not said.',
-      '- Write natural spoken Korean, as short as a subtitle should be. Avoid translationese (needless 그녀/그, 당신, ~하는 것이다, literal idioms).',
-      '- Choose 반말 or 존댓말 from the relationship (friends, family, classmates: 반말; strangers, superiors, polite characters: 존댓말) and keep each character\'s voice the same throughout: rough or gentle, old-fashioned or childish speech, verbal tics and catchphrases.',
-      '- Words for people follow the speaker: お兄ちゃん / 兄さん → 오빠 from a girl, 형 from a boy; お姉ちゃん / 姉さん → 언니 from a girl, 누나 from a boy; 先輩 → 선배, 先生 → 선생님.',
-      '- Other Japanese names in Hangul by the usual Korean fan spelling (e.g. 마히루, 아마네, 츠카사, 쇼타; つ is 츠, not 쓰). Keep the original name order.',
-      '- Honorifics: -san → 씨 or nothing, -kun / -chan → nothing (or 군 / 짱 where it matters), -sama → 님.',
-      '- Set phrases as Koreans say them: いただきます → 잘 먹겠습니다, ごちそうさま → 잘 먹었습니다, ただいま → 다녀왔어, おかえり → 어서 와, いってきます → 다녀올게, お疲れ様 → 수고했어, よろしく → 잘 부탁해.',
-      '- Stammers and cut-off words stay stammers (べ、別に → 벼, 별로); interjections become Korean ones (えっ → 어?, はぁ? → 하아?, よし → 좋아, まあ → 뭐).',
-      '- Jokes and wordplay: keep the effect in Korean rather than the literal words. Song lyrics: translate as lyrics. Attack and spell names: as the fandom would say them, usually translated.',
-      '- Lines that are only sounds, music marks or symbols stay as they are. Keep caption labels in their brackets, translated: (男の子) → (남자아이), [ため息] → [한숨].',
-      '- Keep a line break (\\n) where the original has one if it still reads well.'
+      rules.custom || TRANSLATION_RULES,
+      ...(rules.extra ? ['', 'ADDITIONAL RULES FROM THE USER (follow these first where they differ from the rules above)', rules.extra] : [])
     ].filter(line => line !== null && line !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
   };
 
@@ -526,7 +543,9 @@ function createTranslator(userData) {
     const engineOf = name => name === 'local' ? LOCAL_ENGINE : CLOUDS[name];
     // The prompt version is part of the cache key, so a better prompt is not hidden behind older results.
     const source = fs.readFileSync(file, 'utf8');
-    const hashOf = name => crypto.createHash('sha1').update(`${modelOf(name)}\n${name === 'local' ? LOCAL_PROMPT_VERSION + promptVersion(localModel) : PROMPT_VERSION}${settings.dropCaptions ? '+drop-captions-1' : ''}\n${source}`).digest('hex').slice(0, 20);
+    // 번역 프롬프트 (DeepL takes no instruction: its translations are kept apart from them).
+    const rules = { extra: settings.promptExtra, custom: settings.promptRules };
+    const hashOf = name => crypto.createHash('sha1').update(`${modelOf(name)}\n${name === 'local' ? LOCAL_PROMPT_VERSION + promptVersion(localModel) : PROMPT_VERSION}${settings.dropCaptions ? '+drop-captions-1' : ''}${name !== 'deepl' && (rules.extra || rules.custom) ? `+rules:${JSON.stringify([rules.extra, rules.custom])}` : ''}\n${source}`).digest('hex').slice(0, 20);
     // Kept translations are taken from the side that translates now only: the local AI's for the local AI, the APIs'
     // (the picked one's first, then one another API made when it could not be used) for the API, so the two stay apart.
     // The side is the first one set up: the API asked for without any key is the local AI's side.
@@ -614,8 +633,8 @@ function createTranslator(userData) {
           const position = new Map(lines.map((line, index) => [line, index])), left = new Set(lines);
           const pick = () => { const line = nextLine(left); if (!line) return undefined; left.delete(line); return position.get(line); };
           engine.jump = null;
-          await local.translateLines(lines.map(line => line.text), { modelId: localModel.id, progress, status, context, signal, pick, onLine: (index, text) => { translated.set(lines[index].i, text); lineModel.set(lines[index].i, modelOf(name)); shown([lines[index].i]); keepSoon(name); } });
-        } else await translateCloud(settings, name, modelFor(name), lines, translated, { title, ...context }, { progress, signal, onSwitch, order: playingFirst, near, control: engine, saved: (model, ids) => { for (const i of ids) lineModel.set(i, name === 'gemini' ? model : `${name}${model ? `:${model}` : ''}`); shown(ids); keepSoon(name); } });
+          await local.translateLines(lines.map(line => line.text), { modelId: localModel.id, progress, status, context, rules, signal, pick, onLine: (index, text) => { translated.set(lines[index].i, text); lineModel.set(lines[index].i, modelOf(name)); shown([lines[index].i]); keepSoon(name); } });
+        } else await translateCloud(settings, name, modelFor(name), lines, translated, { title, ...context, rules }, { progress, signal, onSwitch, order: playingFirst, near, control: engine, saved: (model, ids) => { for (const i of ids) lineModel.set(i, name === 'gemini' ? model : `${name}${model ? `:${model}` : ''}`); shown(ids); keepSoon(name); } });
         lastError = null;
       } catch (error) { lastError = error; }
       clearTimeout(saveTimer); saveTimer = null; keep(name); flush();
@@ -666,7 +685,7 @@ function createTranslator(userData) {
     return { path: target, model: Object.keys(models)[0] || '', models, failed, cached: false };
   }
 
-  return { settings, saveSettings, translate, cancel, jump, ready, local, clouds: CLOUDS };
+  return { settings, saveSettings, translate, cancel, jump, ready, local, clouds: CLOUDS, defaultRules: () => TRANSLATION_RULES };
 }
 
 module.exports = { createTranslator, dropCaptions };

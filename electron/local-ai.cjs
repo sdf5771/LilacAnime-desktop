@@ -109,7 +109,11 @@ function translationRequest(source, model) {
 }
 const HY_MT2_INSTRUCTION = 'Translate the following text into Korean. Note that you should only output the translated result without any additional explanation:';
 // cast: the work's main characters ("堀京子 = 호리 쿄코 (female)"), for Gemma, which can tell from them who says 형 or 오빠.
-function request(source, terms, kind, before = [], cast = []) {
+// rules: 번역 프롬프트 {extra, custom}, for the models that follow instructions (Gemma, the general chat models): custom
+// takes the place of the rules below, extra comes after them; the names, word list, lines before and "the Korean line
+// only" stay. Translation-tuned models (HY-MT, Hy-MT2, ja-ko-vn) are asked their own way, without them.
+function request(source, terms, kind, before = [], cast = [], rules = {}) {
+  const extra = rules.extra ? [`Additional rules from the user (follow these first where they differ):\n${rules.extra}`] : [];
   const user = content => [{ role: 'user', content }];
   if (kind === 'jako') return { messages: [...(terms.length ? [{ role: 'system', content: terms.map(term => `${term.ja}=${term.ko}`).join(',') }] : []), { role: 'user', content: source }], temperature: 0.1, top_p: 0.9, repeat_penalty: 1.05 };
   if (kind === 'hy-mt2' || kind === 'hy-mt2-moe') {
@@ -121,16 +125,20 @@ function request(source, terms, kind, before = [], cast = []) {
   if (kind === 'gemma' || kind === 'general') {
     const parts = [...(terms.length ? [`Names and terms (use these Korean spellings):\n${terms.map(term => `${term.ja} = ${term.ko}`).join('\n')}`] : []), ...(before.length ? [`Previous lines (context only, do not translate them):\n${before.join('\n')}`] : []), `Translate this line:\n${source}`];
     const system = [
-      'You translate Japanese anime subtitles into natural spoken Korean, keeping each speaker\'s tone (반말 or 존댓말 as the scene calls for).',
-      'Words for family follow the speaker: お兄ちゃん / 兄さん → 형 from a boy, 오빠 from a girl; お姉ちゃん / 姉さん → 누나 from a boy, 언니 from a girl.',
-      'A speaker\'s name or a sound in brackets at the start stays in brackets, translated: （創太） → (소타), （ため息） → (한숨). Keep the line breaks.',
+      ...(rules.custom ? [rules.custom] : [
+        'You translate Japanese anime subtitles into natural spoken Korean, keeping each speaker\'s tone (반말 or 존댓말 as the scene calls for).',
+        'Words for family follow the speaker: お兄ちゃん / 兄さん → 형 from a boy, 오빠 from a girl; お姉ちゃん / 姉さん → 누나 from a boy, 언니 from a girl.',
+        'A speaker\'s name or a sound in brackets at the start stays in brackets, translated: （創太） → (소타), （ため息） → (한숨). Keep the line breaks.'
+      ]),
       ...(cast.length ? [`Main characters (Japanese name = Korean spelling, gender):\n${cast.join('\n')}`] : []),
+      ...extra,
       'Answer with the Korean line only: no notes, quotes or romanization.'
     ].join('\n');
     return { messages: [{ role: 'system', content: system }, { role: 'user', content: parts.join('\n\n') }], temperature: 0.3, top_p: 0.95, top_k: 64, chat_template_kwargs: { enable_thinking: false } };
   }
   if (kind === 'hy-mt') return { messages: user(terms.length ? `参考下面的翻译：\n${terms.map(term => `${term.ja} 翻译成 ${term.ko}`).join('\n')}\n\n${INSTRUCTION}\n\n${source}` : `${INSTRUCTION}\n\n${source}`), temperature: 0.7, top_p: 0.6, top_k: 20, repeat_penalty: 1.05 };
-  return { messages: user(terms.length ? `This is a line from a Japanese anime. Use these Korean translations:\n${terms.map(term => `${term.ja} = ${term.ko}`).join('\n')}\n\n${INSTRUCTION}\n\n${source}` : `${INSTRUCTION}\n\n${source}`), temperature: 0.7, top_p: 0.8, top_k: 20, repeat_penalty: 1.05 };
+  const instruction = [rules.custom || INSTRUCTION, ...extra].join('\n');
+  return { messages: user(terms.length ? `This is a line from a Japanese anime. Use these Korean translations:\n${terms.map(term => `${term.ja} = ${term.ko}`).join('\n')}\n\n${instruction}\n\n${source}` : `${instruction}\n\n${source}`), temperature: 0.7, top_p: 0.8, top_k: 20, repeat_penalty: 1.05 };
 }
 // Which way to ask: by the model's name, or for a file the user added (ja-ko-vn 12B ships as "model-Q4_K_M.gguf" too)
 // by the chat template llama.cpp read from it.
@@ -549,7 +557,7 @@ function createLocalAi(userData) {
   // context: the work's {characters} from AniList, for the names in the terminology list. pick(): the index of the line
   // to translate next (undefined when none is left), asked as each slot frees up, so the lines follow where the episode
   // is playing (and where it jumps to); the lines before a line are still its neighbours. Without it, in order.
-  async function translateLines(texts, { modelId, progress = () => {}, status = () => {}, onLine = () => {}, context = {}, signal = null, pick = null } = {}) {
+  async function translateLines(texts, { modelId, progress = () => {}, status = () => {}, onLine = () => {}, context = {}, rules = {}, signal = null, pick = null } = {}) {
     const model = models().find(item => item.id === modelId) || models().find(item => item.installed);
     if (!model) throw new Error('로컬 AI 모델이 없습니다. 설정 > 자막 자동 번역에서 모델을 받아 주세요.');
     const { port, template } = await start(model, status);
@@ -576,7 +584,7 @@ function createLocalAi(userData) {
         if (index === undefined) break;
         const source = texts[index], body = languageInput ? translationRequest(source, model)
           : model.customPrompt ? { messages: [{ role: 'user', content: model.customPrompt.replace(/\{(text|source_lang|target_lang)\}/g, (_, key) => ({ text: source, source_lang: sourceLanguage(source, model.sourceLanguage), target_lang: 'ko' })[key]) }], temperature: 0.3 }
-          : request(source, [...termsFor(source, names), ...speakerTerms(source, context.characters)], model.inputMode === 'chat' ? 'chat' : kind, texts.slice(Math.max(0, index - 2), index), cast);
+          : request(source, [...termsFor(source, names), ...speakerTerms(source, context.characters)], model.inputMode === 'chat' ? 'chat' : kind, texts.slice(Math.max(0, index - 2), index), cast, rules);
         try {
           // A Japanese word left in the answer (えっ, 先輩) is asked again, twice at most. ja-ko-vn's temperature of 0.1
           // would give the same answer again, so its second and third tries are less certain.
