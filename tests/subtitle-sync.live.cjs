@@ -1,6 +1,6 @@
 // Live check of 자막 싱크 맞추기 on this machine (macOS or Windows): installs ffsubsync the way the app does (uv, its own
 // Python 3.12) into a temporary folder, makes a video with speech at known times (macOS `say`, Windows SAPI) and a
-// subtitle 3.2 s late, then checks that the quick check finds it, ffsubsync fixes it, and the fixed copy passes.
+// subtitle 3.2 s late, then checks that ffsubsync fixes it and leaves the fixed copy as it is when run again.
 // node tests/subtitle-sync.live.cjs   (GitHub Actions: Subtitle sync check)
 const fs = require('fs'), os = require('os'), path = require('path');
 const { execFileSync } = require('child_process');
@@ -39,23 +39,21 @@ const assStamp = t => { const cs = Math.round(t * 100); return `${Math.floor(cs 
 
   const sync = createSubtitleSync({ userData: path.join(dir, 'userData'), ffmpegPath: ffmpeg, managedRoot: path.join(dir, 'userData', 'subtitles') });
   const videoUrl = pathToFileURL(video).href;
-  const check = await sync.check({ videoUrl, subtitlePath: vtt, duration: LENGTH });
-  console.log('quick check:', JSON.stringify(check));
-  assert.ok(check?.off && Math.abs(check.lag - LATE) <= 0.6, 'the quick check finds the late subtitle');
 
   let started = Date.now(), installSeconds = 0;
   await sync.install((message, progress) => console.log(`  install: ${message}${progress == null ? '' : ` ${Math.round(progress * 100)}%`}`));
   installSeconds = (Date.now() - started) / 1000; started = Date.now();
   assert.ok(sync.installed(), 'ffsubsync is installed');
   const result = await sync.sync({ videoUrl, subtitlePath: vtt, assPath: ass, duration: LENGTH, status: (message, progress) => console.log(`  sync: ${message}${progress == null ? '' : ` ${Math.round(progress * 100)}%`}`) });
-  console.log('ffsubsync:', JSON.stringify({ offset: result.offset, scale: result.scale, score: result.score }), `install ${installSeconds.toFixed(0)} s, sync ${((Date.now() - started) / 1000).toFixed(0)} s`);
-  assert.ok(Math.abs(result.offset + LATE) <= 0.6 && Math.abs(result.scale - 1) < 0.01, 'ffsubsync moves the subtitle back');
+  console.log('ffsubsync:', JSON.stringify({ offset: result.offset, scale: result.scale, checked: result.checked }), `install ${installSeconds.toFixed(0)} s, sync ${((Date.now() - started) / 1000).toFixed(0)} s`);
+  assert.ok(Math.abs(result.offset + LATE) <= 0.6 && result.scale === 1, 'ffsubsync moves the subtitle back');
   const fixed = vttCues(fs.readFileSync(result.path, 'utf8'));
   assert.ok(Math.abs(fixed[0][0] - STARTS[0]) <= 0.6, `first line at ${fixed[0][0]} s`);
   assert.ok(result.assPath && fs.readFileSync(result.assPath, 'utf8').includes('Dialogue: 0,0:00:0'), 'the ASS copy is retimed too');
-  const again = await sync.check({ videoUrl, subtitlePath: result.path, duration: LENGTH });
-  console.log('quick check of the fixed copy:', JSON.stringify(again));
-  assert.ok(again && !again.off, 'the fixed copy is not flagged');
+  // Run again on the fixed copy (as the player does for every subtitle): left as it is.
+  const again = await sync.sync({ videoUrl, subtitlePath: result.path, duration: LENGTH });
+  console.log('second run on the fixed copy:', JSON.stringify({ offset: again.offset, unchanged: again.unchanged || false }));
+  assert.ok(again.unchanged, 'the fixed copy is left as it is');
   console.log('SUBTITLE_SYNC_LIVE_OK');
   fs.rmSync(dir, { recursive: true, force: true });
 })().catch(error => { console.error(error); process.exit(1); });

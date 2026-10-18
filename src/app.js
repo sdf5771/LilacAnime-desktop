@@ -559,9 +559,11 @@ async function offerKoreanSubtitle(title,episode,requestId,current){
   $('#subtitleOfferDismiss').onclick=()=>box.classList.add('hidden');
 }
 // 자막 싱크 맞추기: ffsubsync (in the main process) matches the subtitle on screen to the episode's audio and gives a
-// retimed copy, put on screen and saved as "<name> · 자동 싱크". Once a subtitle is on, a few minutes of the audio are
-// compared with it (설정 싱크가 어긋나면 자동으로 맞추기); when it runs early or late it is synced right away. Either way
-// the box under the player says what was done, with 되돌리기 (the check may take music for talk now and then).
+// retimed copy, put on screen and saved as "<name> · 자동 싱크". Every subtitle put on is run through it in the
+// background (설정 싱크가 어긋나면 자동으로 맞추기), and changed only when its two matches agree on 0.3 s or more (see
+// subtitle-sync.cjs); otherwise it stays as it is without a word. (A first check over a few minutes of audio levels
+// was dropped: with music under the talk, Toradora! 1, it could not tell.) A change is told in the box under the
+// player, with 되돌리기.
 // The 자막 싱크 setting goes back to 0 with it, since the copy is matched as it is (되돌리기 puts it back).
 // A subtitle still being translated (Jimaku with 자동 번역) is checked too. Synced then, its cues are shown moved
 // (timeFix, see applyVttLayout) while the translated lines come in on them, and the fix is kept by its file (syncFixes)
@@ -578,16 +580,23 @@ function showSyncDone(text,undo){
   $('#subtitleOfferApply').textContent='되돌리기';$('#subtitleOfferApply').onclick=()=>{box.classList.add('hidden');if(!undo())toast('이미 다른 자막으로 바뀌어 되돌릴 수 없습니다.')};
   $('#subtitleOfferDismiss').textContent='확인';$('#subtitleOfferDismiss').onclick=()=>box.classList.add('hidden');
 }
-// auto: started by the check, not by the button.
+// auto: started by itself for the subtitle put on, not by the button: it says nothing unless it changes the subtitle.
 async function runSubtitleSync(auto=false){
-  if(subtitleSyncRun){window.lilac.cancelSubtitleSync();return}
-  const subtitle=syncableSubtitle();if(!subtitle){toast('싱크를 맞출 자막이 없습니다.');return}
-  const requestId=playbackRequestId,button=$('#autoSyncSubtitle');subtitleSyncRun={subtitle};button.disabled=false;button.textContent='싱크 맞추는 중 · 눌러서 취소';$('#subtitleOffer').classList.add('hidden');
-  if(auto)$('#subtitleState').textContent='자막 싱크가 어긋나 있어 자동으로 맞추는 중...';
+  if(subtitleSyncRun){if(!auto)window.lilac.cancelSubtitleSync();return}
+  const subtitle=syncableSubtitle();if(!subtitle){if(!auto)toast('싱크를 맞출 자막이 없습니다.');return}
+  const requestId=playbackRequestId,button=$('#autoSyncSubtitle');subtitleSyncRun={subtitle};button.disabled=false;button.textContent='싱크 맞추는 중 · 눌러서 취소';if(!auto)$('#subtitleOffer').classList.add('hidden');
+  if(auto)$('#subtitleState').textContent='자막 싱크 확인 중...';
+  const quiet=()=>{if(currentSubtitle===subtitle&&!translatingNow())$('#subtitleState').textContent=`${subtitle.label} 적용됨`};
   try{
-    const result=await window.lilac.syncSubtitle({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,assPath:subtitle.assPath||null,duration:playbackDuration()});
-    if(result?.canceled){toast('자막 싱크 맞추기를 취소했습니다.');return}
-    if(requestId!==playbackRequestId||currentSubtitle!==subtitle)return;
+    const result=await window.lilac.syncSubtitle({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,assPath:subtitle.assPath||null,timingPath:subtitle.from||null,duration:playbackDuration()});
+    if(result?.canceled){if(!auto)toast('자막 싱크 맞추기를 취소했습니다.');quiet();return}
+    if(requestId!==playbackRequestId||currentSubtitle!==subtitle){
+      // Its translation came on meanwhile (timed as this file): the translation gets its own run.
+      if(requestId===playbackRequestId&&currentSubtitle?.from===subtitle.path){syncChecked.delete(subtitle.path);checkSubtitleSync(currentSubtitle)}
+      return;
+    }
+    // Within 0.3 s: the subtitle stays as it is.
+    if(result.unchanged){quiet();if(!auto)toast(`자막 싱크가 이미 잘 맞아요 (${Math.abs(result.offset).toFixed(2)}초 차이)`);return}
     syncChecked.add(result.path);
     const offset=result.offset,moved=Math.abs(offset)<0.05&&Math.abs(result.scale-1)<0.0005?'이미 잘 맞아요':`${Math.abs(offset).toFixed(2)}초 ${offset<0?'앞당김':'늦춤'}`;
     const manual=Number(localStorage.getItem('subtitleSync')||0);if(manual)setSubtitleSync(0);
@@ -614,21 +623,25 @@ async function runSubtitleSync(auto=false){
       attachSubtitle(subtitle.src,subtitle.label,{path:subtitle.path,assUrl:subtitle.assUrl,assPath:subtitle.assPath,fonts:subtitle.fonts||[],source:subtitle.source,from:subtitle.from||null,fromName:subtitle.fromName||'',notice:'자막 싱크를 원래대로 되돌렸습니다.'});
       return true;
     });
-  }catch(error){if(requestId===playbackRequestId){toast(`자막 싱크 ${auto?'자동 ':''}맞추기 실패: ${error.message}`);$('#subtitleState').textContent='자막 싱크를 맞추지 못했습니다.'}}
+  }catch(error){if(requestId===playbackRequestId){
+    // A result it could not be sure of (or a failed run) leaves the subtitle as it is: said only when asked by the button.
+    const message=ipcMessage(error),unsure=/확신할 수 없어/.test(message);if(auto||unsure)quiet();else $('#subtitleState').textContent='자막 싱크를 맞추지 못했습니다.';
+    if(!auto)toast(unsure?`자막 싱크: ${message}`:`자막 싱크 맞추기 실패: ${message}`);
+  }}
   finally{subtitleSyncRun=null;renderSyncButton()}
 }
-function checkSubtitleSync(subtitle){
-  // A translation is timed as the file it was made from: checked once, with that file.
+// Each subtitle put on is synced once in the background, a little after it is on (the stream's first segments come
+// first; the episode's length is needed for the progress). A translation is timed as the file it was made from, so it
+// is not run again when that file was.
+function checkSubtitleSync(subtitle,tries=0){
   if(localStorage.getItem('subtitleSyncCheck')==='false'||!subtitle?.path||syncChecked.has(subtitle.path)||subtitle.from&&syncChecked.has(subtitle.from)||subtitle.label?.endsWith(SYNCED))return;
   const requestId=playbackRequestId;clearTimeout(checkSubtitleSync.timer);
-  // A little after the start, so the stream's first segments come first.
-  checkSubtitleSync.timer=setTimeout(async()=>{
-    const duration=playbackDuration(),busy=()=>requestId!==playbackRequestId||currentSubtitle!==subtitle||subtitleSyncRun;
-    if(busy()||!duration||!syncableSubtitle())return;syncChecked.add(subtitle.path);
-    const found=await window.lilac.checkSubtitleSync({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,duration,offsetMs:Number(localStorage.getItem('subtitleSync')||0)}).catch(()=>null);
-    if(!found?.off||busy())return;
-    runSubtitleSync(true);
-  },6000);
+  checkSubtitleSync.timer=setTimeout(()=>{
+    if(requestId!==playbackRequestId||currentSubtitle!==subtitle||!syncableSubtitle())return;
+    // Another sync still running, or the length not known yet: tried again a little later.
+    if(subtitleSyncRun||!playbackDuration()){if(tries<10)checkSubtitleSync(subtitle,tries+1);return}
+    syncChecked.add(subtitle.path);runSubtitleSync(true);
+  },tries?5000:6000);
 }
 $('#autoSyncSubtitle').onclick=()=>runSubtitleSync();
 // ffsubsync is installed in the background half a minute after start (after the start's own downloads), while 자동으로

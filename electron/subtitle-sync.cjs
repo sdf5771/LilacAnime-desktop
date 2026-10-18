@@ -1,12 +1,12 @@
-// Subtitle sync to the episode's audio. check(): a quick look at a few minutes of audio (FFmpeg only) that tells
-// whether the subtitle on screen runs early or late, so the player can offer to fix it. sync(): ffsubsync over the
-// whole episode; its offset and frame-rate scale are then applied to the VTT and the ASS beside it, so styles, fonts
-// and effects stay as they are. ffsubsync runs in its own Python, installed once under userData/tools by uv.
+// Subtitle sync to the episode's audio. sync(): ffsubsync over the whole episode (the player runs it for every
+// subtitle put on, and for its button); the offset it finds is then applied to the VTT and the ASS beside it, so
+// styles, fonts and effects stay as they are. ffsubsync runs in its own Python, installed once under userData/tools by uv.
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const { fileURLToPath, pathToFileURL } = require('url');
+const { dropCaptions } = require('./subtitle-translator.cjs');
 
 const UV_VERSION = '0.13.1', FFSUBSYNC_VERSION = '0.5.1', PYTHON_VERSION = '3.12';
 const MAC = process.platform === 'darwin', WIN = process.platform === 'win32';
@@ -45,6 +45,21 @@ function vttCues(text) {
   return cues;
 }
 
+// The cues ffsubsync is matched with: dialogue only. Sound captions and speaker-only lines（拍手）, song lyrics (♪) and
+// signs at the top ({\an8}) are on screen while nobody talks; they are left out (all cues are kept when that would
+// leave fewer than 20, or under a third of them).
+function dialogueVtt(text) {
+  const blocks = String(text).replace(/^﻿/, '').replace(/\r/g, '').split(/\n{2,}/), cues = [];
+  for (const block of blocks) {
+    const lines = block.split('\n'), at = lines.findIndex(line => line.includes('-->'));
+    if (at < 0) continue;
+    const body = lines.slice(at + 1).join('\n'), plain = body.replace(/<[^>]*>/g, '').replace(/\{\\[^}]*\}/g, '');
+    cues.push({ timing: lines[at], body, dialogue: !/\{\\an[789]\}/.test(body) && !/[♪♫]/.test(plain) && Boolean(dropCaptions(plain)) });
+  }
+  const dialogue = cues.filter(cue => cue.dialogue), use = dialogue.length >= 20 && dialogue.length >= cues.length / 3 ? dialogue : cues;
+  return `WEBVTT\n\n${use.map(cue => `${cue.timing}\n${cue.body || 'x'}\n`).join('\n')}`;
+}
+
 // time → time * scale + offset (ffsubsync's order: the scale first, then the offset), on the timing lines only.
 function retimeVtt(text, offset, scale = 1) {
   const stamp = /((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})/g;
@@ -67,34 +82,6 @@ function parseResult(output) {
   const flat = String(output).replace(/\r/g, '').replace(/\s*\n\s*/g, ' ');
   const offset = flat.match(/offset seconds:\s*(-?\d+(?:\.\d+)?)/i), scale = flat.match(/framerate scale factor:\s*(\d+(?:\.\d+)?)/i), score = flat.match(/score:\s*(-?\d+(?:\.\d+)?)/i);
   return offset ? { offset: Number(offset[1]), scale: scale ? Number(scale[1]) : 1, score: score ? Number(score[1]) : null } : null;
-}
-
-// Speech energy every 50 ms against "a cue is on" over the same time, compared at shifts of ±10 s: the shift that
-// matches best is how late the subtitle is (negative: early). Talk over music still lifts the 200–3500 Hz energy
-// enough; a shift is only told when it clearly beats no shift.
-const CHECK_RATE = 8000, FRAME = 0.05, MAX_LAG = 10;
-function estimateLag(samples, windowStart, cues) {
-  const hop = CHECK_RATE * FRAME, frames = Math.floor(samples.length / hop);
-  if (frames < 600) return null;
-  const energy = new Float64Array(frames);
-  for (let f = 0; f < frames; f++) { let sum = 0; for (let i = f * hop; i < (f + 1) * hop; i++) sum += samples[i] * samples[i]; energy[f] = Math.log10(sum / hop + 1e-9); }
-  // The noise floor (the quietest tenth of each 4 s around) is taken away, so a loud scene does not count as talk.
-  const floorSpan = Math.round(4 / FRAME), audio = new Float64Array(frames);
-  for (let f = 0; f < frames; f++) { const near = Array.from(energy.subarray(Math.max(0, f - floorSpan / 2), Math.min(frames, f + floorSpan / 2))).sort((a, b) => a - b); audio[f] = energy[f] - near[Math.floor(near.length * 0.1)]; }
-  const lagFrames = Math.round(MAX_LAG / FRAME), span = frames + 2 * lagFrames, shown = new Float64Array(span);
-  for (const [start, end] of cues) {
-    const from = Math.max(0, Math.round((start - windowStart) / FRAME) + lagFrames), to = Math.min(span, Math.round((end - windowStart) / FRAME) + lagFrames);
-    for (let i = from; i < to; i++) shown[i] = 1;
-  }
-  const normalize = values => { let mean = 0; for (const v of values) mean += v; mean /= values.length; let sd = 0; for (const v of values) sd += (v - mean) ** 2; sd = Math.sqrt(sd / values.length) || 1; return values.map(v => (v - mean) / sd); };
-  const a = normalize(audio), scores = [];
-  for (let lag = -lagFrames; lag <= lagFrames; lag++) {
-    const part = normalize(shown.subarray(lagFrames + lag, lagFrames + lag + frames));
-    let sum = 0; for (let f = 0; f < frames; f++) sum += a[f] * part[f];
-    scores.push({ lag: lag * FRAME, score: sum / frames });
-  }
-  const best = scores.reduce((top, item) => item.score > top.score ? item : top), zero = scores[lagFrames];
-  return { lag: Math.round(best.lag * 100) / 100, score: best.score, zero: zero.score };
 }
 
 function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
@@ -167,10 +154,11 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
     return installing;
   }
 
-  // The episode's audio as 16 kHz mono WAV; progress from FFmpeg's time= against the duration.
+  // The episode's audio as 16 kHz stereo WAV (the centre is taken from it, see sync); progress from FFmpeg's time=
+  // against the duration.
   async function extractAudio(videoUrl, headers, duration, target, status, signal) {
     const { input, args } = ffmpegInput(videoUrl, headers);
-    await run(ffmpegPath, ['-hide_banner', '-nostdin', '-y', ...args, '-i', input, '-map', '0:a:0', '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', target], {
+    await run(ffmpegPath, ['-hide_banner', '-nostdin', '-y', ...args, '-i', input, '-map', '0:a:0', '-vn', '-ac', '2', '-ar', '16000', '-c:a', 'pcm_s16le', target], {
       signal, onOutput: text => { const time = text.match(/time=(\d+:\d{2}:\d{2}(?:\.\d+)?)/g)?.pop(); if (time && duration > 0) status('영상 음성 읽는 중', Math.min(1, seconds(time.slice(5)) / duration)); },
     });
   }
@@ -186,8 +174,16 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
     return path.join(dir, `${base}.sync-${Date.now().toString(36)}${ext}`);
   }
 
-  // subtitlePath: the VTT on screen; assPath: its ASS, retimed the same way.
-  async function sync({ videoUrl, headers = {}, subtitlePath, assPath = null, duration = 0, status = () => {} }) {
+  // subtitlePath: the VTT on screen; assPath: its ASS, retimed the same way; timingPath: the file a translation was made
+  // from (its Japanese lines tell dialogue from captions better; the times are the same).
+  // Toradora! 1 (Netflix ja[cc] from Jimaku, music under most of the talk) came out +28.4 s with a 1.042 frame-rate
+  // scale, where the subtitle was 1.3 s late. So ffsubsync never changes the frame rate (web releases do not need it)
+  // and hears the centre of the stereo mix, where dialogue sits with the music spread around it: there it found -1.32 s
+  // with any set of lines, where the whole mix swung between -1.34 and +44 s as ten lines came and went. It is asked
+  // twice, with the dialogue lines only (captions, lyrics and signs left out) and with every line; the result counts
+  // only when both say the same, as a wrong match does not hold when the lines change. Under 0.3 s the subtitle is left
+  // as it is.
+  async function sync({ videoUrl, headers = {}, subtitlePath, assPath = null, timingPath = null, duration = 0, status = () => {} }) {
     if (running) throw new Error('이미 자막 싱크를 맞추는 중입니다.');
     if (!/^(https?|file):/i.test(videoUrl || '')) throw new Error('이 영상은 자동 싱크를 쓸 수 없습니다.');
     if (!subtitlePath || !fs.existsSync(subtitlePath)) throw new Error('자막 파일이 없습니다.');
@@ -200,11 +196,22 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
       status('영상 음성 읽는 중', 0);
       await extractAudio(videoUrl, headers, Number(duration) || 0, wav, status, abort.signal);
       status('ffsubsync로 대사 위치 맞추는 중', null);
-      const output = await run(exe, [wav, '-i', subtitlePath, '-o', path.join(work, 'out.vtt'), '--ffmpeg-path', path.dirname(ffmpegPath)], {
-        signal: abort.signal, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', COLUMNS: '400', NO_COLOR: '1', TERM: 'dumb' },
-      });
-      const result = parseResult(output);
-      if (!result) throw new Error('ffsubsync가 결과를 알려 주지 않았습니다.');
+      const timing = path.join(work, 'dialogue.vtt'), center = path.join(work, 'center.wav');
+      fs.writeFileSync(timing, dialogueVtt(fs.readFileSync(timingPath && fs.existsSync(timingPath) ? timingPath : subtitlePath, 'utf8')));
+      let centerOk = true;
+      try { await run(ffmpegPath, ['-hide_banner', '-nostdin', '-y', '-i', wav, '-af', 'dialoguenhance=original=0:enhance=3,pan=mono|c0=FC', '-ar', '16000', '-c:a', 'pcm_s16le', center], { signal: abort.signal }); } catch (error) { if (abort.signal.aborted) throw error; centerOk = false; }
+      const ask = async lines => {
+        const output = await run(exe, [centerOk ? center : wav, '-i', lines, '-o', path.join(work, 'out.vtt'), '--ffmpeg-path', path.dirname(ffmpegPath), '--no-fix-framerate'], {
+          signal: abort.signal, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', COLUMNS: '400', NO_COLOR: '1', TERM: 'dumb' },
+        });
+        const found = parseResult(output);
+        if (!found) throw new Error('ffsubsync가 결과를 알려 주지 않았습니다.');
+        return found.offset;
+      };
+      const dialogue = await ask(timing), every = await ask(subtitlePath);
+      if (Math.abs(dialogue - every) > 0.5) throw Object.assign(new Error(`음성 분석 결과가 서로 달라(${dialogue.toFixed(1)}초 / ${every.toFixed(1)}초) 싱크를 확신할 수 없어 그대로 뒀어요.`), { uncertain: true });
+      const offset = Math.round(dialogue * 100) / 100, result = { offset, scale: 1, checked: { dialogue, every } };
+      if (Math.abs(offset) < 0.3) return { ...result, unchanged: true };
       return { ...result, ...retime({ subtitlePath, assPath, ...result }) };
     } finally {
       running = null;
@@ -222,37 +229,9 @@ function createSubtitleSync({ userData, ffmpegPath, managedRoot }) {
     return { path: vtt, url: pathToFileURL(vtt).href, assPath: ass, assUrl: ass ? pathToFileURL(ass).href : null };
   }
 
-  // A few minutes of the episode where the subtitle has the most lines (one of the windows every 30 s): how late
-  // the subtitle as shown (with the 자막 싱크 setting) is, or null when it cannot be told.
-  async function check({ videoUrl, headers = {}, subtitlePath, duration = 0, offsetMs = 0, signal = null }) {
-    duration = Number(duration) || 0;
-    if (!/^(https?|file):/i.test(videoUrl || '') || !subtitlePath || !fs.existsSync(subtitlePath) || duration < 120) return null;
-    const shift = (Number(offsetMs) || 0) / 1000, cues = vttCues(fs.readFileSync(subtitlePath, 'utf8')).map(([s, e]) => [s + shift, e + shift]);
-    const length = Math.min(240, duration);
-    let start = 0, most = -1;
-    for (let at = 0; at + length <= duration; at += 30) { const count = cues.filter(([s]) => s >= at && s < at + length).length; if (count > most) { most = count; start = at; } }
-    if (most < 12) return null;
-    const { input, args } = ffmpegInput(videoUrl, headers), chunks = [];
-    await new Promise((resolve, reject) => {
-      const child = spawn(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-nostdin', ...args, '-ss', String(start), '-i', input, '-t', String(length), '-map', '0:a:0', '-vn', '-ac', '1', '-ar', String(CHECK_RATE), '-af', 'highpass=f=200,lowpass=f=3500', '-f', 's16le', 'pipe:1'], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-      children.add(child);
-      const abort = () => child.kill(); signal?.addEventListener('abort', abort, { once: true });
-      child.stdout.on('data', chunk => chunks.push(chunk));
-      child.once('error', reject);
-      child.once('close', code => { children.delete(child); signal?.removeEventListener('abort', abort); code === 0 ? resolve() : reject(new Error(`FFmpeg ${code}`)); });
-    });
-    const raw = Buffer.concat(chunks), samples = new Float32Array(Math.floor(raw.length / 2));
-    for (let i = 0; i < samples.length; i++) samples[i] = raw.readInt16LE(i * 2) / 32768;
-    const found = estimateLag(samples, start, cues);
-    if (!found) return null;
-    // Told only when the match is real and the shift beats none by a margin.
-    const off = Math.abs(found.lag) >= 0.5 && found.score >= 0.12 && found.score - found.zero >= 0.06;
-    return { ...found, off };
-  }
-
   function cancel() { running?.abort(); }
   function stop() { cancel(); for (const child of children) child.kill(); }
-  return { installed, install, sync, retime, check, cancel, stop, running: () => Boolean(running) };
+  return { installed, install, sync, retime, cancel, stop, running: () => Boolean(running) };
 }
 
-module.exports = { createSubtitleSync, retimeVtt, retimeAss, parseResult, estimateLag, vttCues };
+module.exports = { createSubtitleSync, retimeVtt, retimeAss, parseResult, vttCues, dialogueVtt };
