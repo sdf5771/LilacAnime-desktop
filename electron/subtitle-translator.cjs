@@ -11,6 +11,34 @@ const { characterTerms } = require('./anime-glossary.cjs');
 
 const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta';
 const PROMPT_VERSION = 'prompt-3', LOCAL_PROMPT_VERSION = 'local-4';
+// 효과음·화자 이름 빼고 번역 (설정 > 자막 자동 번역): a line's caption labels and speaker name are taken out by the app
+// before it is translated, since a translation-only model (TranslateGemma) takes no instruction to leave them out.
+// - Labels in brackets anywhere on a line: a name or a sound, （創太） （ため息） （ドアの開く音） [laughs] (SIGHS). A Japanese
+//   one is a label when it is kanji / katakana alone (a name, 拍手, 足音) or ends in a sound word (…音, …声, ため息);
+//   one with hiragana otherwise is kept, as Japanese subtitles bracket a character's thoughts too: （どうしよう）.
+//   An English one is a label when it is three words at most without sentence marks.
+// - A short label before the words on a line is the speaker's, with hiragana too: （男の子）こんにちは.
+// - A speaker before a colon at the start: 創太： SOTA: (an English one in capitals only, so "Note: …" stays).
+// - A line of vocal sounds alone: あっ, うう…, くっ, はあ, あはは, ふふっ, Ugh!, Hahaha (not うん, ええ, ううん: those are words).
+// A cue left with nothing is not translated and is left out of the translated file.
+const SOUND_WORD = /(?:音|声|息|笑い|笑|泣き|悲鳴|咳|咳払い|拍手|歓声|鼻歌|舌打ち|いびき|あくび|くしゃみ|うめき|叫び|ノック|チャイム|ベル|着信|振動|鳴る|鳴く|音楽|BGM)$/;
+const VOCAL = /^(?:[あぁアァ]+|[うぅウゥ]+|[くク]+|[ぐグ]+|[んン]+|[ひヒ]+|[へヘ]+|[ほホ]+|[ふフ]+|[はハ][あぁアァ]*|(?:[あぁアァ]?[はハ])+|(?:[うぅウゥ]?[ふフ])+|(?:[えぇエェ]?[へヘ])+|(?:[いぃイィ]?[ひヒ])+|a+h*|o+h+|u+g*h+|h+m+|m+|(?:h[aeio]){2,}|gr+|a+r+g+h+|o+w+)$/i;
+function captionLabel(inside) {
+  const value = inside.trim();
+  if (!value || /[。、！？!?…]/.test(value)) return false;
+  if (/^[\p{Script=Han}\p{Script=Katakana}ー・々\s]+$/u.test(value) || SOUND_WORD.test(value)) return true;
+  return !/[\p{Script=Hiragana}\p{Script=Han}\p{Script=Katakana}]/u.test(value) && value.split(/\s+/).length <= 3;
+}
+function dropCaptions(text) {
+  return String(text).split('\n').map(line => {
+    // A short label before the words is the speaker's, hiragana or not: （男の子）こんにちは.
+    let value = line.trim().replace(/^[（(［[]([^（）()［］[\]\n]{1,12})[）)］\]]\s*(?=\S)/, (label, inside) => /[。、！？!?…]/.test(inside) ? label : '');
+    value = value.replace(/[（(［[]([^（）()［］[\]\n]{1,20})[）)］\]]/g, (label, inside) => captionLabel(inside) ? ' ' : label).trim();
+    value = value.replace(/^[\p{Script=Han}\p{Script=Katakana}ー・々]{1,10}[：:]\s*/u, '').replace(/^[A-Z][A-Z0-9 .'-]{0,20}:\s+/, '').trim();
+    const words = value.split(/[\s、。，,.!！?？…‥~～〜・-]+/).map(word => word.replace(/[ーっッ]/g, '')).filter(Boolean);
+    return words.length && words.every(word => VOCAL.test(word)) || !/\p{L}/u.test(value) ? '' : value.replace(/\s{2,}/g, ' ');
+  }).filter(Boolean).join('\n');
+}
 // The translation APIs (with the Korean particles their names take) and how each is fed: Gemini gets a whole episode
 // (a few hundred short lines) in one request where possible, since its free tier allows only a few requests a minute
 // and a few dozen a day; OpenAI and Qwen answer shorter batches faster and stay within their output limits; DeepL takes
@@ -51,6 +79,9 @@ function createTranslator(userData) {
       // The next episode is made ready ahead by the local AI when it translates; by the API only when this is on (it
       // spends the API's allowance on an episode that may not be watched).
       prepareNextCloud: value.prepareNextCloud === true,
+      // 효과음·화자 이름 빼고 번역: caption labels, sound-only lines and speaker names are taken out before any engine sees
+      // the lines (see dropCaptions).
+      dropCaptions: value.dropCaptions === true,
       // How a picked Jimaku file is translated by itself: 'off', 'cloud' or 'local' ('gemini' before the other APIs came;
       // older settings still: on = whichever is set up).
       jimakuTranslate: value.jimakuTranslate === 'gemini' ? 'cloud' : ['off', 'cloud', 'local'].includes(value.jimakuTranslate) ? value.jimakuTranslate : value.autoJimaku === false ? 'off' : 'cloud' };
@@ -139,6 +170,7 @@ function createTranslator(userData) {
     if ('translateDownloads' in change) Object.assign(next, { translateDownloads: change.translateDownloads === true, translateDownloadsChosen: true });
     if ('jimakuTranslate' in change && ['off', 'cloud', 'local'].includes(change.jimakuTranslate)) next.jimakuTranslate = change.jimakuTranslate;
     if ('prepareNextCloud' in change) next.prepareNextCloud = change.prepareNextCloud === true;
+    if ('dropCaptions' in change) next.dropCaptions = change.dropCaptions === true;
     if ('cloud' in change && Object.hasOwn(CLOUDS, change.cloud)) next.cloud = change.cloud;
     if ('qwenRegion' in change && ['international', 'china'].includes(change.qwenRegion)) next.qwenRegion = change.qwenRegion;
     if ('openaiModel' in change && next.openaiModels.includes(change.openaiModel)) next.openaiModel = change.openaiModel;
@@ -494,7 +526,7 @@ function createTranslator(userData) {
     const engineOf = name => name === 'local' ? LOCAL_ENGINE : CLOUDS[name];
     // The prompt version is part of the cache key, so a better prompt is not hidden behind older results.
     const source = fs.readFileSync(file, 'utf8');
-    const hashOf = name => crypto.createHash('sha1').update(`${modelOf(name)}\n${name === 'local' ? LOCAL_PROMPT_VERSION + promptVersion(localModel) : PROMPT_VERSION}\n${source}`).digest('hex').slice(0, 20);
+    const hashOf = name => crypto.createHash('sha1').update(`${modelOf(name)}\n${name === 'local' ? LOCAL_PROMPT_VERSION + promptVersion(localModel) : PROMPT_VERSION}${settings.dropCaptions ? '+drop-captions-1' : ''}\n${source}`).digest('hex').slice(0, 20);
     // Kept translations are taken from the side that translates now only: the local AI's for the local AI, the APIs'
     // (the picked one's first, then one another API made when it could not be used) for the API, so the two stay apart.
     // The side is the first one set up: the API asked for without any key is the local AI's side.
@@ -525,6 +557,9 @@ function createTranslator(userData) {
     const blanks = [...new Set(paired.filter(span => dropped.has(span.cue)).map(span => span.text))].filter(raw => !cues.some(cue => plain(cue.text) === raw)).map(raw => ({ raw, text: '' }));
     // Identical lines (repeated cues, karaoke layers) are translated once. raw: the cue's text as it is (with its tags).
     const unique = [...new Set(cues.map(cue => plain(cue.text)).filter(text => /\p{L}/u.test(untagged(text))))].map((raw, i) => ({ i, raw, text: untagged(raw) }));
+    // 효과음·화자 이름 빼고 번역: the engines get each line without them; silent: the lines left with nothing.
+    const silent = new Set();
+    if (settings.dropCaptions) for (const line of unique) { line.text = dropCaptions(line.text); if (!line.text) silent.add(line.i); }
     // Where each line is first heard, and the order to translate them in: from a few seconds before where the episode is
     // playing to the end, then the beginning (in time order). A jump moves that place for the lines still left.
     const start = new Map(); for (const cue of cues) { const raw = plain(cue.text); if (!start.has(raw)) start.set(raw, seconds(cue.timing)); }
@@ -548,16 +583,17 @@ function createTranslator(userData) {
     }
     // The translated lines go to the player together every 0.7 s (the local AI writes a few a second).
     const pending = new Set(); let flushTimer = null;
-    const item = i => ({ raw: unique[i].raw, text: escapeCue(positionTag(unique[i].raw) + translated.get(i)) });
+    const item = i => ({ raw: unique[i].raw, text: silent.has(i) ? '' : escapeCue(positionTag(unique[i].raw) + translated.get(i)) });
     // The Chinese lines of a bilingual file go with the first ones, as blanks (the player leaves them out).
     let blanksSent = !blanks.length;
     const flush = () => { clearTimeout(flushTimer); flushTimer = null; if (!pending.size) return; onLines([...(blanksSent ? [] : blanks), ...[...pending].map(item)]); blanksSent = true; pending.clear(); };
     control.done = () => [...blanks, ...[...translated.keys()].map(item)];
     const shown = ids => { for (const i of ids) pending.add(i); flushTimer ||= setTimeout(flush, 700); };
+    for (const i of silent) translated.set(i, '');
     shown(translated.keys());
     let saveTimer = null;
     const keep = name => {
-      for (const i of translated.keys()) if (!by.has(i)) by.set(i, name);
+      for (const i of translated.keys()) if (!by.has(i) && !silent.has(i)) by.set(i, name);
       const lines = Object.fromEntries(unique.filter(line => by.get(line.i) === name).map(line => [line.text, translated.get(line.i)]));
       if (!Object.keys(lines).length) return;
       try { fs.mkdirSync(cacheDir, { recursive: true }); fs.writeFileSync(linesFile(name), JSON.stringify(lines), 'utf8'); } catch { /* kept in memory for this run */ }
@@ -594,9 +630,9 @@ function createTranslator(userData) {
     // The models that did the lines, most first, are written into the file (the cache is named by the picked model, so
     // the file says which one it really was) and given with the result.
     const models = {};
-    for (const i of translated.keys()) { const model = lineModel.get(i) || modelOf(by.get(i) || main); models[model] = (models[model] || 0) + 1; }
+    for (const i of translated.keys()) { if (silent.has(i)) continue; const model = lineModel.get(i) || modelOf(by.get(i) || main); models[model] = (models[model] || 0) + 1; }
     const ranked = Object.fromEntries(Object.entries(models).sort((a, b) => b[1] - a[1]));
-    const written = writeResult(cues, unique, translated, hashOf(main), ranked);
+    const written = writeResult(cues, unique, translated, hashOf(main), ranked, new Set([...silent].map(i => unique[i].raw)));
     if (!written.failed) for (const name of used) try { fs.unlinkSync(linesFile(name)); } catch { /* none kept */ }
     const result = { ...written, engine: engineOf(main).name };
     // Said when the one asked for (the button's API or the local AI) did not do it all.
@@ -612,14 +648,15 @@ function createTranslator(userData) {
     const list = head.match(/^translated-by: (.+)$/m)?.[1] || '';
     return Object.fromEntries(list.split('; ').map(item => item.match(/^(.+)=(\d+)$/)).filter(Boolean).map(match => [match[1], Number(match[2])]));
   };
-  function writeResult(cues, unique, translated, hash, models) {
+  // left: the cues left out (the ones 효과음·화자 이름 빼고 번역 left with nothing).
+  function writeResult(cues, unique, translated, hash, models, left = new Set()) {
     if (!translated.size) throw new Error('번역 결과를 받지 못했습니다.');
     const out = path.join(cacheDir, `${hash}.vtt`), failed = unique.length - translated.size;
     const byText = new Map(unique.filter(line => translated.has(line.i)).map(line => [line.raw, positionTag(line.raw) + translated.get(line.i)]));
     // Cues with the same timing (an ASS file's separate lines) become one cue, or the player draws them on top of
     // each other; a top line ({\an8}) and a bottom one are kept apart, so each stays where it belongs.
     const merged = new Map();
-    for (const cue of cues) { const raw = plain(cue.text), text = escapeCue(byText.get(raw) || raw), key = `${cue.timing}\n${/\{\\an[789]\}/.test(raw) ? 'top' : ''}`; merged.set(key, merged.has(key) ? `${merged.get(key)}\n${text}` : text); }
+    for (const cue of cues) { const raw = plain(cue.text); if (left.has(raw)) continue; const text = escapeCue(byText.get(raw) || raw), key = `${cue.timing}\n${/\{\\an[789]\}/.test(raw) ? 'top' : ''}`; merged.set(key, merged.has(key) ? `${merged.get(key)}\n${text}` : text); }
     const body = [...merged].map(([key, text]) => `${key.split('\n')[0]}\n${text}`).join('\n\n');
     fs.mkdirSync(cacheDir, { recursive: true });
     // Unfinished results are not cached, so a later try can fill the gaps.
@@ -632,4 +669,4 @@ function createTranslator(userData) {
   return { settings, saveSettings, translate, cancel, jump, ready, local, clouds: CLOUDS };
 }
 
-module.exports = { createTranslator };
+module.exports = { createTranslator, dropCaptions };

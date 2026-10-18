@@ -402,7 +402,7 @@ async function resolveIntoPlayer(resolver,name,context={},subtitleTitle='',episo
 
 function play(src,name='직접 재생',context={}) {
   pendingResumeSeconds=Number.isFinite(context.resumeSeconds)?Math.max(0,context.resumeSeconds):null;
-  ++playbackRequestId;resetAutoSkipState();const video=$('#video');currentPlaybackContext={...context,currentUrl:src};cancelOtherEpisodeTranslations();clearSubtitle();renderSubtitleSheet();skipSegments=[];activeSkip=null;activeSkipKey=null;opEdAnalysisKey=null;if(hlsPlayer){hlsPlayer.destroy();hlsPlayer=null;} video.removeAttribute('src');
+  ++playbackRequestId;resetAutoSkipState();const video=$('#video');currentPlaybackContext={...context,currentUrl:src};cancelOtherEpisodeTranslations();window.lilac.cancelSubtitleSync?.();clearSubtitle();renderSubtitleSheet();skipSegments=[];activeSkip=null;activeSkipKey=null;opEdAnalysisKey=null;if(hlsPlayer){hlsPlayer.destroy();hlsPlayer=null;} video.removeAttribute('src');
   enterPlayer();setPlayerLocked(false);showPlayerControls();updateEpisodeButtons();$('#playerEmpty').classList.remove('hidden');$('#subtitleState').textContent='온라인 자막을 확인하는 중...';
   const isHls=/\.m3u8(?:$|\?)/i.test(src)||/\/__flix\//i.test(src)||Boolean(context.hls);
   if(isHls&&window.Hls?.isSupported()){
@@ -482,7 +482,7 @@ function attachSubtitle(src,label='자막',options={}){
   if(options.source==='gemini')options={...options,assUrl:null,assPath:null,fonts:[]};
   const video=$('#video');clearSubtitle();const subtitle={src,label,...options,assRendering:false};currentSubtitle=subtitle;if(KOREAN_SOURCES.includes(options.source))currentPlaybackContext.koreanFound=true;
   const track=document.createElement('track');track.kind='subtitles';track.label=label;track.srclang='ko';track.src=src;track.default=true;video.append(track);
-  track.addEventListener('load',()=>{if(currentSubtitle!==subtitle)return;applyVttLayout();setVttVisible();if(translating?.lines&&translating.path===subtitle.path)showTranslatedLines([]);if(!translatingNow())$('#subtitleState').textContent=`${label} 적용됨${subtitle.assUrl&&assEffectsEnabled()?' · ASS 효과':''}`;toast(options.notice||`${label}을 적용했습니다.`)});
+  track.addEventListener('load',()=>{if(currentSubtitle!==subtitle)return;applyVttLayout();setVttVisible();if(translating?.lines&&translating.path===subtitle.path)showTranslatedLines([]);if(!translatingNow())$('#subtitleState').textContent=`${label} 적용됨${subtitle.assUrl&&assEffectsEnabled()?' · ASS 효과':''}`;toast(options.notice||`${label}을 적용했습니다.`);checkSubtitleSync(subtitle)});
   track.addEventListener('error',()=>{if(currentSubtitle===subtitle)$('#subtitleState').textContent='자막 파일을 불러오지 못했습니다.'});
   renderAssSubtitle();
   if(options.source==='user')fetch(src).then(response=>response.text()).then(text=>{const body=text.replace(/^WEBVTT.*$/m,'').replace(/\d{2}:\d{2}[:.,\d]* --> [^\n]*/g,''),count=pattern=>(body.match(pattern)||[]).length,hangul=count(/[가-힣]/g);subtitle.korean=hangul>count(/[぀-ヿ一-龯a-zA-Z]/g);if(currentSubtitle===subtitle)renderSubtitleSheet()}).catch(()=>{});
@@ -531,7 +531,7 @@ function labelTranslateButtons(){
 function renderSubtitleSheet(){
   $$('#psSubtitleSources button').forEach(button=>button.classList.toggle('selected',button.dataset.source===activeSubtitleSource()));
   $('#subtitleTranslateRow').classList.toggle('hidden',!translatableSubtitle()&&!retranslatable()&&!['#translateNow','#translateNowLocal'].some(id=>$(id).dataset.run));labelTranslateButtons();
-  renderSubtitleTracks();renderJimaku();if(typeof renderAnissiaMakers==='function')renderAnissiaMakers();
+  renderSubtitleTracks();renderJimaku();if(typeof renderAnissiaMakers==='function')renderAnissiaMakers();renderSyncButton();
 }
 // Kairan → Csora → Anissia (the preferred one first), started while the stream is still being resolved so the
 // result is usually ready when playback starts. One search per title and episode. The three are asked at once and
@@ -558,6 +558,50 @@ async function offerKoreanSubtitle(title,episode,requestId,current){
   $('#subtitleOfferApply').textContent='바꾸기';$('#subtitleOfferApply').onclick=()=>{box.classList.add('hidden');if(requestId===playbackRequestId){preferAiSubtitle(false);attachOnlineSubtitle(found)}};
   $('#subtitleOfferDismiss').onclick=()=>box.classList.add('hidden');
 }
+// 자막 싱크 맞추기: ffsubsync (in the main process) matches the subtitle on screen to the episode's audio and gives a
+// retimed copy, put on screen and saved as "<name> · 자동 싱크". Once a subtitle is on, a few minutes of the audio are
+// compared with it (설정 싱크가 어긋나면 알려 주기); when it runs early or late the box under the player offers the fix.
+// The 자막 싱크 setting goes back to 0 with it, since the copy is matched as it is.
+let subtitleSyncRun=null;const syncChecked=new Set();
+const SYNCED=' · 자동 싱크';
+function syncableSubtitle(){const subtitle=currentSubtitle;return subtitle?.path&&/^(https?|file):/i.test(currentPlaybackContext.currentUrl||'')?subtitle:null}
+function renderSyncButton(){const button=$('#autoSyncSubtitle');if(!button||subtitleSyncRun)return;button.disabled=!syncableSubtitle();button.textContent='음성에 맞춰 싱크 맞추기'}
+window.lilac.onSubtitleSyncStatus?.(({message,progress})=>{if(!subtitleSyncRun)return;const text=`${message}${progress!=null?` ${Math.round(progress*100)}%`:''}`;$('#subtitleState').textContent=text;$('#autoSyncSubtitle').textContent=`${text} · 눌러서 취소`});
+async function runSubtitleSync(){
+  if(subtitleSyncRun){window.lilac.cancelSubtitleSync();return}
+  const subtitle=syncableSubtitle();if(!subtitle){toast('싱크를 맞출 자막이 없습니다.');return}
+  const requestId=playbackRequestId,button=$('#autoSyncSubtitle');subtitleSyncRun={subtitle};button.disabled=false;button.textContent='싱크 맞추는 중 · 눌러서 취소';$('#subtitleOffer').classList.add('hidden');
+  try{
+    const result=await window.lilac.syncSubtitle({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,assPath:subtitle.assPath||null,duration:playbackDuration()});
+    if(result?.canceled){toast('자막 싱크 맞추기를 취소했습니다.');return}
+    if(requestId!==playbackRequestId||currentSubtitle!==subtitle)return;
+    syncChecked.add(result.path);
+    const offset=result.offset,moved=Math.abs(offset)<0.05&&Math.abs(result.scale-1)<0.0005?'이미 잘 맞아요':`${Math.abs(offset).toFixed(2)}초 ${offset<0?'앞당김':'늦춤'}`;
+    const manual=Number(localStorage.getItem('subtitleSync')||0);if(manual)setSubtitleSync(0);
+    if(currentSubtitlePath===subtitle.path)currentSubtitlePath=result.path;
+    if(subtitle.source==='jimaku'&&currentPlaybackContext.jimakuSubtitle?.path===subtitle.path)currentPlaybackContext.jimakuSubtitle={...currentPlaybackContext.jimakuSubtitle,path:result.path};
+    attachSubtitle(result.url,`${subtitle.label.replace(SYNCED,'')}${SYNCED}`,{path:result.path,assUrl:result.assUrl,assPath:result.assPath,fonts:subtitle.fonts||[],source:subtitle.source,from:subtitle.from||null,fromName:subtitle.fromName||'',notice:`자막 싱크를 맞췄습니다 (${moved}${manual?' · 수동 싱크 0으로':''})`});
+  }catch(error){if(requestId===playbackRequestId){toast(`자막 싱크 맞추기 실패: ${error.message}`);$('#subtitleState').textContent='자막 싱크를 맞추지 못했습니다.'}}
+  finally{subtitleSyncRun=null;renderSyncButton()}
+}
+function checkSubtitleSync(subtitle){
+  if(localStorage.getItem('subtitleSyncCheck')==='false'||!subtitle?.path||syncChecked.has(subtitle.path)||subtitle.label?.endsWith(SYNCED))return;
+  const requestId=playbackRequestId;clearTimeout(checkSubtitleSync.timer);
+  // A little after the start, so the stream's first segments come first.
+  checkSubtitleSync.timer=setTimeout(async()=>{
+    const duration=playbackDuration(),busy=()=>requestId!==playbackRequestId||currentSubtitle!==subtitle||subtitleSyncRun||(translating&&translating.path===subtitle.path);
+    if(busy()||!duration||!syncableSubtitle())return;syncChecked.add(subtitle.path);
+    const found=await window.lilac.checkSubtitleSync({videoUrl:currentPlaybackContext.currentUrl,headers:currentPlaybackContext.streamHeaders||{},subtitlePath:subtitle.path,duration,offsetMs:Number(localStorage.getItem('subtitleSync')||0)}).catch(()=>null);
+    if(!found?.off||busy())return;
+    const box=$('#subtitleOffer');$('#subtitleOfferText').textContent=`자막이 대사보다 약 ${Math.abs(found.lag).toFixed(1)}초 ${found.lag>0?'늦게':'빨리'} 나오는 것 같아요. 싱크를 맞출까요?`;
+    box.classList.remove('hidden');clearTimeout(offerKoreanSubtitle.timer);offerKoreanSubtitle.timer=setTimeout(()=>box.classList.add('hidden'),20000);
+    $('#subtitleOfferApply').textContent='싱크 맞추기';$('#subtitleOfferApply').onclick=()=>{box.classList.add('hidden');if(requestId===playbackRequestId&&currentSubtitle===subtitle)runSubtitleSync()};
+    $('#subtitleOfferDismiss').onclick=()=>box.classList.add('hidden');
+  },6000);
+}
+$('#autoSyncSubtitle').onclick=runSubtitleSync;
+$('#subtitleSyncCheck').checked=localStorage.getItem('subtitleSyncCheck')!=='false';
+$('#subtitleSyncCheck').onchange=event=>localStorage.setItem('subtitleSyncCheck',String(event.target.checked));
 async function ensureSubtitle(stream,title,episode,{skipSaved=false}={}){
   const requestId=playbackRequestId,preferred=localStorage.getItem('subtitleSource')||'reanime',key=subtitleStoreKey();
   $('#subtitleOffer').classList.add('hidden');
@@ -1025,7 +1069,7 @@ const CLOUD_FIELDS={
 };
 function renderTranslationSettings(value,message,messageFor){
   translationSettings=value||translationSettings;renderLocalAi(value);if(!value)return;
-  $('#geminiDownloads').checked=value.translateDownloads===true;$('#prepareNextCloud').checked=value.prepareNextCloud===true;$$('#jimakuTranslateChoices button').forEach(button=>button.classList.toggle('selected',button.dataset.value===(value.jimakuTranslate||'off')));
+  $('#geminiDownloads').checked=value.translateDownloads===true;$('#prepareNextCloud').checked=value.prepareNextCloud===true;$('#dropCaptions').checked=value.dropCaptions===true;$$('#jimakuTranslateChoices button').forEach(button=>button.classList.toggle('selected',button.dataset.value===(value.jimakuTranslate||'off')));
   $$('#cloudChoices button').forEach(button=>button.classList.toggle('selected',button.dataset.value===value.cloud));$$('.cloud-block').forEach(block=>block.classList.toggle('hidden',block.dataset.cloud!==value.cloud));
   $$('#qwenRegionChoices button').forEach(button=>button.classList.toggle('selected',button.dataset.value===value.qwenRegion));
   for(const field of Object.values(CLOUD_FIELDS)){
@@ -1052,7 +1096,7 @@ for(const cloud of Object.keys(CLOUD_FIELDS)){
 $$('#cloudChoices button').forEach(button=>button.onclick=()=>saveTranslation({cloud:button.dataset.value}));
 $$('#qwenRegionChoices button').forEach(button=>button.onclick=()=>saveTranslation({qwenRegion:button.dataset.value}));
 $('#geminiDownloads').onchange=()=>saveTranslation({translateDownloads:$('#geminiDownloads').checked});
-$('#prepareNextCloud').onchange=()=>saveTranslation({prepareNextCloud:$('#prepareNextCloud').checked});
+$('#prepareNextCloud').onchange=()=>saveTranslation({prepareNextCloud:$('#prepareNextCloud').checked});$('#dropCaptions').onchange=()=>saveTranslation({dropCaptions:$('#dropCaptions').checked});
 // 자막 캐시: how much the subtitle files take, and how much of it no saved subtitle uses.
 const megabytes=bytes=>bytes>=1e9?`${(bytes/1e9).toFixed(1)}GB`:`${Math.max(bytes?0.1:0,bytes/1e6).toFixed(1)}MB`;
 async function renderSubtitleCache(message){try{const usage=await window.lilac.subtitleCacheUsage();$('#subtitleCacheState').textContent=`${message?`${message} `:''}자막 파일 ${megabytes(usage.total)} 중 ${megabytes(usage.removable)}를 지울 수 있어요.`;$('#cleanSubtitleCache').disabled=!usage.removable}catch{$('#subtitleCacheState').textContent='자막 파일 용량을 확인하지 못했습니다.'}}
@@ -1081,11 +1125,12 @@ function renderLocalAi(value){
     if(model.path){
       row.classList.add('local-model-custom');
       const options=document.createElement('details');options.className='local-model-options';
-      options.innerHTML='<summary>번역 입력 설정</summary><div class="local-model-fields"><label>입력 형식<select class="local-input-mode"><option value="auto">자동 · 모델 템플릿</option><option value="chat">일반 지시문</option><option value="translation">원문 + 언어 지정</option></select></label><label>원문 언어<select class="local-source-language"><option value="auto">자동</option><option value="ja">일본어</option><option value="en">영어</option><option value="zh">중국어</option><option value="ko">한국어</option></select></label><label class="local-prompt-field">사용자 프롬프트<textarea rows="4" maxlength="8000" placeholder="Translate the following text into Korean. Output only the translation.\n\n{text}"></textarea><small>비워 두면 기본 프롬프트 사용 · {text}: 원문 · {source_lang}: 원문 언어 · {target_lang}: ko</small></label><button type="button" class="local-options-save">저장</button></div>';
+      options.innerHTML='<summary>번역 입력 설정</summary><div class="local-model-fields"><label>입력 형식<select class="local-input-mode"><option value="auto">자동 · 모델 템플릿</option><option value="chat">일반 지시문</option><option value="translation">원문 + 언어 지정</option></select></label><label>원문 언어<select class="local-source-language"><option value="auto">자동</option><option value="ja">일본어</option><option value="en">영어</option><option value="zh">중국어</option><option value="ko">한국어</option></select></label><label class="local-prompt-field">사용자 프롬프트<textarea rows="4" maxlength="8000" placeholder="Translate the following text into Korean. Output only the translation.\n\n{text}"></textarea><small>비워 두면 기본 프롬프트 사용 · {text}: 원문 · {source_lang}: 원문 언어 · {target_lang}: ko</small></label><small class="local-prompt-note" hidden>번역 전용 모델(TranslateGemma 등)이라 프롬프트를 쓰지 않아요. 이런 모델은 지시를 따르지 않고 프롬프트까지 번역해서 자막에 나옵니다. 효과음·화자 이름은 위의 <b>효과음·화자 이름 빼고 번역</b>으로 뺄 수 있어요.</small><button type="button" class="local-options-save">저장</button></div>';
       const mode=options.querySelector('.local-input-mode'),language=options.querySelector('.local-source-language'),prompt=options.querySelector('textarea'),save=options.querySelector('.local-options-save');
       mode.value=model.inputMode||'auto';language.value=model.sourceLanguage||'auto';prompt.value=model.customPrompt||'';
-      const update=()=>{options.querySelector('.local-prompt-field').hidden=mode.value==='translation'};mode.onchange=update;update();
-      save.onclick=async()=>{save.disabled=true;try{renderTranslationSettings(await window.lilac.setLocalModelOptions(model.id,{inputMode:mode.value,sourceLanguage:language.value,customPrompt:prompt.value}));toast('번역 입력 설정을 저장했어요.')}catch(error){toast(`저장하지 못했습니다: ${ipcMessage(error)}`);save.disabled=false}};
+      // A translation-only model (its template takes the source and the languages) is never asked with a prompt in 자동.
+      const update=()=>{const languageOnly=mode.value==='translation'||mode.value==='auto'&&model.translationOnly;options.querySelector('.local-prompt-field').hidden=languageOnly;options.querySelector('.local-prompt-note').hidden=!(mode.value==='auto'&&model.translationOnly)};mode.onchange=update;update();
+      save.onclick=async()=>{save.disabled=true;try{renderTranslationSettings(await window.lilac.setLocalModelOptions(model.id,{inputMode:mode.value,sourceLanguage:language.value,customPrompt:mode.value==='auto'&&model.translationOnly?'':prompt.value}));toast('번역 입력 설정을 저장했어요.')}catch(error){toast(`저장하지 못했습니다: ${ipcMessage(error)}`);save.disabled=false}};
       row.append(options);
     }
     return row;

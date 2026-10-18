@@ -36,6 +36,15 @@ app.whenReady().then(async () => {
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.equal(await win.webContents.executeJavaScript(`calls[1].options.customPrompt`), '{source_lang} -> {target_lang}: {text}');
   assert.equal(await win.webContents.executeJavaScript(`document.querySelector('.local-prompt-field').hidden`), false);
+  // A translation-only model (TranslateGemma) in 자동: no prompt field, the reason instead, and its old prompt is cleared.
+  await win.webContents.executeJavaScript(`
+    Object.assign(settings.localModels[0], { translationOnly: true, inputMode: 'auto', customPrompt: 'Rules\\n{text}' }); renderLocalAi(settings);
+    document.querySelector('.local-model-options').open = true; document.querySelector('.local-options-save').click();
+  `);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(await win.webContents.executeJavaScript(`document.querySelector('.local-prompt-field').hidden`), true);
+  assert.equal(await win.webContents.executeJavaScript(`document.querySelector('.local-prompt-note').hidden`), false);
+  assert.equal(await win.webContents.executeJavaScript(`calls[2].options.customPrompt`), '');
   console.log('Custom GGUF input settings: mode, language, prompt, save and re-render passed.');
   win.destroy(); app.quit();
 }).catch(error => { console.error(error); app.exit(1); });

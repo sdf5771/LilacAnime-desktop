@@ -41,12 +41,23 @@ test('manual language mode handles missing template detection and survives re-ad
   assert.equal(calls[0].body.chat_template_kwargs.source_lang_code, 'zh');
   assert.equal(ai.models().find(model => model.id === id).inputMode, 'translation');
 });
-test('custom prompts override automatic translation mode without substituting placeholders inside source text', async t => {
-  const { ai, id, calls } = setup(t);
+test('custom prompts ask chat models without substituting placeholders inside source text', async t => {
+  const { ai, id, calls } = setup(t, { template: '{{ messages }}' });
   ai.setModelOptions(id, { inputMode: 'auto', sourceLanguage: 'ja', customPrompt: '{source_lang} -> {target_lang}\n{text}' });
   await ai.translateLines(['こんにちは {target_lang}'], { modelId: id });
   assert.equal(calls[0].body.messages[0].content, 'ja -> ko\nこんにちは {target_lang}');
   assert.equal(calls[0].body.chat_template_kwargs, undefined);
+});
+test('a language template (TranslateGemma) gets the source alone: a saved prompt would be translated into the subtitle', async t => {
+  const { ai, id, calls } = setup(t);
+  ai.setModelOptions(id, { inputMode: 'auto', sourceLanguage: 'auto', customPrompt: 'Remove all sound effects.\n\n{text}' });
+  await ai.translateLines(['（ため息）'], { modelId: id });
+  assert.deepEqual(calls[0].body.messages, [{ role: 'user', content: '（ため息）' }]);
+  assert.equal(calls[0].body.chat_template_kwargs.target_lang_code, 'ko');
+  // Once it has run, the settings know it and a prompt is refused with the reason.
+  assert.equal(ai.models().find(model => model.id === id).translationOnly, true);
+  assert.throws(() => ai.setModelOptions(id, { inputMode: 'auto', sourceLanguage: 'auto', customPrompt: 'Rules\n{text}' }), /번역 전용/);
+  ai.setModelOptions(id, { inputMode: 'auto', sourceLanguage: 'auto', customPrompt: '' });
 });
 test('ordinary chat models retain a Korean translation instruction and manual chat mode overrides language templates', async t => {
   const { ai, id, calls } = setup(t, { template: '{{ messages }}' });

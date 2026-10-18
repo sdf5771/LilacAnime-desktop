@@ -171,3 +171,19 @@ for (const api of ['gemini', 'openai', 'qwen', 'deepl']) {
     assert.equal(calls, 1);
   });
 }
+
+test('효과음·화자 이름 빼고 번역: labels and speaker names never reach the engine, and sound-only cues leave the file', async t => {
+  const sent = [];
+  const { ai, dir } = setup(t, async (url, init) => {
+    const body = JSON.parse(init.body); sent.push(...body.text);
+    return response({ translations: body.text.map(() => ({ text: '어?' })) });
+  }, { cloud: 'deepl', deeplKey: 'fake:fx', dropCaptions: true });
+  const file = path.join(dir, 'source.vtt');
+  fs.writeFileSync(file, 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n（創太）えっ？\n\n00:00:03.000 --> 00:00:04.000\n（ため息）\n\n00:00:05.000 --> 00:00:06.000\nはあ…\n');
+  const result = await ai.translate({ file, provider: 'cloud' });
+  assert.deepEqual(sent, ['えっ？']);
+  assert.equal(result.failed, 0);
+  const out = fs.readFileSync(result.path, 'utf8');
+  assert.match(out, /00:00:01.000 --> 00:00:02.000\n어\?/);
+  assert.doesNotMatch(out, /00:00:03|00:00:05|ため息|はあ/);
+});

@@ -89,9 +89,15 @@ const INSTRUCTION = 'Translate the following segment into Korean, without additi
 // Language-aware templates consume the source itself, not a translation instruction.
 // Detect the template's inputs rather than a model/file name; kwargs survive llama.cpp's
 // OpenAI message normalization (extra fields inside content parts do not).
+// A language template (TranslateGemma's) puts whatever the user turn holds after its own "translate the following text"
+// instruction, so a prompt of the user's own was translated as part of the line and showed up in the subtitle: such a
+// model takes the source alone, whatever prompt is saved for it (only 일반 지시문 chosen by hand asks it otherwise).
+const languageTemplate = template => /\bsource_lang_code\b/.test(template) && /\btarget_lang_code\b/.test(template);
+// Known to the settings by the template it was last translated with (saved with the run).
+const translationOnly = model => Boolean(model.run?.languageTemplate);
 function translationInput(model, template = '') {
   const mode = model.inputMode || 'auto';
-  return mode === 'translation' || mode === 'auto' && !model.customPrompt && /\bsource_lang_code\b/.test(template) && /\btarget_lang_code\b/.test(template);
+  return mode === 'translation' || mode === 'auto' && languageTemplate(template);
 }
 function sourceLanguage(source, configured = 'auto') {
   if (configured !== 'auto') return configured;
@@ -156,6 +162,7 @@ function createLocalAi(userData) {
     const ran = runs();
     return [...MODELS, ...added().map(item => ({ id: `file:${item.path}`, label: path.basename(item.path), note: '직접 추가한 파일', path: item.path, size: item.size, inputMode: item.inputMode || 'auto', sourceLanguage: item.sourceLanguage || 'auto', customPrompt: item.customPrompt || '' }))]
       .map(model => ({ ...model, installed: fs.existsSync(modelPath(model)), downloading: downloads.has(model.id) ? { done: downloads.get(model.id).done, total: downloads.get(model.id).total } : null, partial: !model.path && !downloads.has(model.id) ? partialSize(model) : 0, run: ran[modelPath(model)] || null, ...(model.ram ? { memory, lowMemory: memory < model.ram } : {}) }))
+      .map(model => ({ ...model, translationOnly: translationOnly(model) }))
       .filter(model => !model.legacy || model.installed);
   };
   const partialSize = model => { try { return fs.statSync(`${modelPath(model)}.part`).size; } catch { return 0; } };
@@ -172,6 +179,7 @@ function createLocalAi(userData) {
     if (!['auto', 'ja', 'en', 'zh', 'ko'].includes(options.sourceLanguage)) throw new Error('올바른 원문 언어를 선택해 주세요.');
     const customPrompt = String(options.customPrompt || '');
     if (customPrompt.length > 8000 || customPrompt && !customPrompt.includes('{text}')) throw new Error('프롬프트에는 원문이 들어갈 {text}를 넣어 주세요.');
+    if (customPrompt && options.inputMode === 'auto' && models().find(model => model.id === id)?.translationOnly) throw new Error('이 모델은 번역 전용이라 프롬프트를 지시로 따르지 않고 원문과 함께 번역해 버립니다. 프롬프트를 비워 주세요.');
     Object.assign(item, { inputMode: options.inputMode, sourceLanguage: options.sourceLanguage, customPrompt });
     fs.writeFileSync(addedFile, JSON.stringify(list));
   }
@@ -546,6 +554,7 @@ function createLocalAi(userData) {
     if (!model) throw new Error('로컬 AI 모델이 없습니다. 설정 > 자막 자동 번역에서 모델을 받아 주세요.');
     const { port, template } = await start(model, status);
     const languageInput = translationInput(model, template);
+    if (template && translationOnly(model) !== languageTemplate(template)) saveRun(modelPath(model), { ...runs()[modelPath(model)], languageTemplate: languageTemplate(template) });
     const names = characterTerms(context.characters || []), kind = modelKind(model, template);
     const cast = (context.characters || []).slice(0, 15).map(character => { const full = names.find(term => term.ja === String(character.native || '').trim()); return full ? `${full.ja} = ${full.ko}${/^(?:male|female)$/i.test(character.gender) ? ` (${character.gender.toLowerCase()})` : ''}` : ''; }).filter(Boolean);
     // An answer is cut off at a few times the line's length (a subtitle line never needs more), so a model stuck
